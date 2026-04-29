@@ -1,0 +1,40 @@
+---
+# Quick check: what machines are currently enrolled in MaaS?
+- name: Check MaaS machines
+  hosts: maas_region
+  gather_facts: false
+  tasks:
+    - name: Login to MaaS CLI
+      ansible.builtin.shell: >
+        maas login admin http://localhost:5240/MAAS
+        $(maas apikey --username admin)
+      become: true
+      changed_when: false
+      no_log: true
+      register: _login
+      failed_when: false
+
+    - name: List all machines
+      ansible.builtin.command: maas admin machines read
+      become: true
+      register: _machines
+      changed_when: false
+      when: _login.rc == 0
+
+    - name: Show machine summary
+      ansible.builtin.shell: |
+        echo '{{ _machines.stdout }}' | python3 -c "
+        import json, sys
+        machines = json.load(sys.stdin)
+        for m in machines:
+            macs = [i['mac_address'] for i in m.get('interface_set', [])]
+            print(f\"  {m['hostname']:20s} {m['status_name']:15s} {m['system_id']}  MACs={macs}\")
+        "
+      changed_when: false
+      register: _summary
+      when: _login.rc == 0
+
+    - name: Display machine summary
+      ansible.builtin.debug:
+        msg: "{{ _summary.stdout_lines }}"
+      when: _login.rc == 0

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+. "$(git rev-parse --show-toplevel)/set_env.sh"
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+_activate_python_locally "$SCRIPT_DIR"
+
+cd "${SCRIPT_DIR}" && exec python3 -m fw_repos_diagram_exporter.main "$@"

@@ -1,0 +1,374 @@
+---
+# configure-plain-host-ovs — configure OVS bridges on a plain (non-Proxmox) managed host.
+#
+# Reads the declarative `bridges:` list from pwy-home-lab-pkg.yaml for the target
+# machine (specified via MACHINE env var) and applies each bridge with technology: ovs.
+#
+# Tools used per distro:
+#   Ubuntu (Noble+): openvswitch-switch via apt; bridge created via ovs-vsctl;
+#                    persistent IP via netplan (writes /etc/netplan/60-ovs-bridges.yaml).
+#   Rocky Linux:     openvswitch from EPEL; bridge created via ovs-vsctl;
+#                    persistent IP via nmcli (ovs-bridge + ovs-port + ovs-interface).
+#   RHEL:            Same as Rocky but requires CRB + EPEL via direct RPM URL.
+#
+# The script is idempotent: it checks for existing bridges and connections before creating.
+#
+# Input (env vars):
+#   MACHINE  (str) - Machine name in pwy-home-lab-pkg.yaml (e.g. "ms01-03")
+
+# ── Play 1: Load config and locate target machine ─────────────────────────────
+
+- name: Load pwy-home-lab-pkg config and find target machine
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Load config_base role (sets _tg_providers)
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Find machine entry by name in MaaS config_params
+      # MaaS machine entries live at paths like:
+      #   pwy-home-lab-pkg/_stack/maas/pwy-homelab/machines/<name>
+      # Child sub-units (commission, ready, etc.) have additional path components,
+      # so matching on the last path component == MACHINE uniquely targets the root entry.
+      ansible.builtin.set_fact:
+        _machine_path: "{{ item.key }}"
+        _machine_cfg: "{{ item.value }}"
+      loop: "{{ _tg_providers.maas.config_params | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - "'/machines/' ~ lookup('env', 'MACHINE') in item.key"
+        - item.key.split('/')[-1] == lookup('env', 'MACHINE')
+
+    - name: Assert machine entry found
+      ansible.builtin.assert:
+        that: _machine_cfg is defined
+        fail_msg: >
+          Machine '{{ lookup('env', 'MACHINE') }}' not found in pwy-home-lab-pkg.yaml
+          providers.maas.config_params. Check MACHINE env var spelling.
+
+    - name: Find MaaS server IP from parent config entry
+      # The parent pwy-homelab config entry has maas_host set; use it as jump host
+      # for SSH to the provisioning VLAN (10.0.12.0/24, not directly routable).
+      ansible.builtin.set_fact:
+        _maas_server_ip: >-
+          {{ (_tg_providers.maas.config_params | dict2items
+              | selectattr('value.maas_host', 'defined') | first).value.maas_host
+             | default('10.0.10.11') }}
+
+    - name: Extract OVS bridges and SSH target from machine config
+      # Use provisioning_ip (VLAN 12 DHCP) as SSH target when available — this is
+      # the IP the machine has immediately after MaaS deploys it, before OVS is
+      # configured. Provisioning VLAN is not directly routable; jump via MaaS server.
+      # Fall back to cloud_public_ip for machines that are already fully configured.
+      ansible.builtin.set_fact:
+        _ovs_bridges: >-
+          {{ (_machine_cfg.bridges | default([]))
+             | selectattr('technology', 'equalto', 'ovs')
+             | list }}
+        _target_ip: >-
+          {{ _machine_cfg.provisioning_ip
+             if _machine_cfg.provisioning_ip | default('') != ''
+             else _machine_cfg.cloud_public_ip }}
+        _use_jump: "{{ _machine_cfg.provisioning_ip | default('') != '' }}"
+        _ssh_user: "{{ _machine_cfg.cloud_init_user | default('ubuntu') }}"
+
+    - name: Assert at least one OVS bridge is declared
+      ansible.builtin.assert:
+        that: _ovs_bridges | length > 0
+        fail_msg: >
+          No bridges with technology: ovs found for machine
+          '{{ lookup('env', 'MACHINE') }}'. Add a bridges: entry with
+          technology: ovs to the machine's config in pwy-home-lab-pkg.yaml.
+
+    - name: Report plan
+      ansible.builtin.debug:
+        msg: |
+          Machine    : {{ lookup('env', 'MACHINE') }}
+          Target     : {{ _target_ip }} (user: {{ _ssh_user }})
+          Jump host  : {{ ('ubuntu@' ~ _maas_server_ip) if _use_jump else '(none — direct)' }}
+          Bridges    : {{ _ovs_bridges | map(attribute='name') | list }}
+
+    - name: Add target host dynamically
+      ansible.builtin.add_host:
+        name: "{{ _target_ip }}"
+        groups: ovs_target
+        ansible_user: "{{ _ssh_user }}"
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          {{ '-J ubuntu@' ~ _maas_server_ip if _use_jump else '' }}
+        ovs_bridges: "{{ _ovs_bridges }}"
+
+# ── Play 2: Configure OVS on the target host ─────────────────────────────────
+
+- name: Configure OVS bridges on plain host
+  hosts: ovs_target
+  gather_facts: false
+  become: true
+
+  tasks:
+
+    # ── Detect distro ─────────────────────────────────────────────────────────
+
+    - name: Gather distribution facts
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - "!min"
+          - distribution
+          - distribution_major_version
+
+    - name: Fail if distro is not supported
+      ansible.builtin.fail:
+        msg: >
+          OVS configuration is only defined for Ubuntu, Debian, Rocky Linux, and RHEL.
+          Detected: {{ ansible_distribution }}. Add a block for this distro in
+          scripts/ai-only-scripts/configure-plain-host-ovs/playbook.yaml.
+      when: ansible_distribution not in ["Ubuntu", "Debian", "Rocky", "RedHat"]
+
+    # ── Install OVS packages ──────────────────────────────────────────────────
+
+    - name: Install OpenVSwitch packages (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - openvswitch-switch
+          - openvswitch-common
+        state: present
+        update_cache: true
+      when: ansible_distribution in ["Debian", "Ubuntu"]
+
+    - name: Enable EPEL repo (Rocky Linux)
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+      when: ansible_distribution == "Rocky"
+
+    - name: Enable CodeReady Linux Builder repo (RHEL)
+      ansible.builtin.command:
+        cmd: >
+          dnf config-manager --set-enabled
+          codeready-builder-for-rhel-{{ ansible_distribution_major_version }}-x86_64-rpms
+      register: _rhel_crb
+      changed_when: _rhel_crb.rc == 0
+      when: ansible_distribution == "RedHat"
+
+    - name: Install EPEL release RPM (RHEL)
+      ansible.builtin.dnf:
+        name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+        state: present
+        disable_gpg_check: false
+      when: ansible_distribution == "RedHat"
+
+    - name: Install OpenVSwitch package (Rocky/RHEL — from EPEL)
+      ansible.builtin.dnf:
+        name: openvswitch
+        state: present
+      when: ansible_distribution in ["Rocky", "RedHat"]
+
+    - name: Enable and start openvswitch service
+      ansible.builtin.systemd:
+        name: openvswitch
+        state: started
+        enabled: true
+      when: ansible_distribution in ["Rocky", "RedHat"]
+
+    # ── Create OVS bridges ────────────────────────────────────────────────────
+
+    - name: "Warn: nic is empty — bridge will have no physical uplink"
+      ansible.builtin.debug:
+        msg: >
+          Bridge {{ item.name }} has nic: "" — OVS bridge will be created without
+          a physical NIC uplink. Run scripts/ai-only-scripts/discover-10g-nics to find
+          the NIC name, update bridges[].nic in pwy-home-lab-pkg.yaml, and re-run.
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.nic | default('') == ''
+
+    - name: Create OVS bridge via ovs-vsctl (idempotent)
+      ansible.builtin.command:
+        cmd: ovs-vsctl --may-exist add-br {{ item.name }}
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    - name: Add physical NIC to OVS bridge (when nic is set)
+      ansible.builtin.command:
+        cmd: ovs-vsctl --may-exist add-port {{ item.name }} {{ item.nic }}
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.nic | default('') != ''
+      changed_when: true
+
+    # ── Persist IP assignment — Ubuntu (netplan) ──────────────────────────────
+
+    - name: Write netplan OVS config (Ubuntu)
+      ansible.builtin.copy:
+        dest: /etc/netplan/60-ovs-bridges.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by configure-plain-host-ovs — do not edit manually.
+          # Re-run scripts/ai-only-scripts/configure-plain-host-ovs to update.
+          network:
+            version: 2
+            openvswitch: {}
+          {% for bridge in ovs_bridges %}
+          {% if bridge.nic | default('') != '' %}
+            ethernets:
+              {{ bridge.nic }}:
+                dhcp4: false
+          {% endif %}
+            bridges:
+              {{ bridge.name }}:
+                openvswitch: {}
+          {% if bridge.nic | default('') != '' %}
+                interfaces: [{{ bridge.nic }}]
+          {% endif %}
+          {% if bridge.host_ip | default('') != '' %}
+                addresses:
+                  - {{ bridge.host_ip }}/24
+          {% if bridge.gateway | default('') != '' %}
+                routes:
+                  - to: default
+                    via: {{ bridge.gateway }}
+          {% endif %}
+          {% endif %}
+          {% endfor %}
+      when: ansible_distribution in ["Ubuntu", "Debian"]
+
+    - name: Apply netplan config (Ubuntu)
+      ansible.builtin.command: netplan apply
+      when: ansible_distribution in ["Ubuntu", "Debian"]
+      changed_when: true
+
+    # ── Persist IP assignment — Rocky/RHEL (nmcli) ───────────────────────────
+    # nmcli models OVS as: ovs-bridge (the switch) → ovs-port (logical port) →
+    # ovs-interface (the host IP endpoint). Physical NIC gets its own ovs-port.
+
+    - name: Create nmcli ovs-bridge connection (Rocky/RHEL)
+      ansible.builtin.command: >
+        nmcli connection add
+        type ovs-bridge
+        conn.interface {{ item.name }}
+        con-name ovs-bridge-{{ item.name }}
+        connection.autoconnect yes
+        ifname {{ item.name }}
+      args:
+        creates: "/etc/NetworkManager/system-connections/ovs-bridge-{{ item.name }}.nmconnection"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: ansible_distribution in ["Rocky", "RedHat"]
+
+    - name: Create nmcli ovs-port for bridge (Rocky/RHEL)
+      ansible.builtin.command: >
+        nmcli connection add
+        type ovs-port
+        conn.interface {{ item.name }}
+        con-name ovs-port-{{ item.name }}
+        master {{ item.name }}
+        connection.autoconnect yes
+      args:
+        creates: "/etc/NetworkManager/system-connections/ovs-port-{{ item.name }}.nmconnection"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: ansible_distribution in ["Rocky", "RedHat"]
+
+    - name: Create nmcli ovs-interface for host IP (Rocky/RHEL)
+      ansible.builtin.command: >
+        nmcli connection add
+        type ovs-interface
+        slave-type ovs-port
+        conn.interface {{ item.name }}-host
+        con-name ovs-iface-{{ item.name }}-host
+        master ovs-port-{{ item.name }}
+        connection.autoconnect yes
+        ipv4.method manual
+        ipv4.addresses {{ item.host_ip }}/24
+        {% if item.gateway | default('') != '' %}ipv4.gateway {{ item.gateway }}{% endif %}
+      args:
+        creates: "/etc/NetworkManager/system-connections/ovs-iface-{{ item.name }}-host.nmconnection"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - ansible_distribution in ["Rocky", "RedHat"]
+        - item.host_ip | default('') != ''
+
+    - name: Attach physical NIC to OVS bridge via nmcli (Rocky/RHEL, when nic set)
+      ansible.builtin.command: >
+        nmcli connection add
+        type ovs-port
+        conn.interface {{ item.nic }}
+        con-name ovs-port-{{ item.nic }}
+        master {{ item.name }}
+        connection.autoconnect yes
+      args:
+        creates: "/etc/NetworkManager/system-connections/ovs-port-{{ item.nic }}.nmconnection"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - ansible_distribution in ["Rocky", "RedHat"]
+        - item.nic | default('') != ''
+
+    - name: Attach NIC ethernet to OVS port (Rocky/RHEL)
+      ansible.builtin.command: >
+        nmcli connection add
+        type ethernet
+        conn.interface {{ item.nic }}
+        con-name ovs-eth-{{ item.nic }}
+        master ovs-port-{{ item.nic }}
+        connection.autoconnect yes
+      args:
+        creates: "/etc/NetworkManager/system-connections/ovs-eth-{{ item.nic }}.nmconnection"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - ansible_distribution in ["Rocky", "RedHat"]
+        - item.nic | default('') != ''
+
+    - name: Bring up OVS connections (Rocky/RHEL)
+      ansible.builtin.command: nmcli connection up ovs-bridge-{{ item.name }}
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: ansible_distribution in ["Rocky", "RedHat"]
+      changed_when: true
+      failed_when: false  # bridge may already be up
+
+    # ── Verify ────────────────────────────────────────────────────────────────
+
+    - name: Verify OVS bridges are present
+      ansible.builtin.command: ovs-vsctl list-br
+      register: _ovs_list
+      changed_when: false
+
+    - name: Assert each configured bridge is present
+      ansible.builtin.assert:
+        that: item.name in _ovs_list.stdout
+        fail_msg: "OVS bridge {{ item.name }} was not found in ovs-vsctl list-br output"
+      loop: "{{ ovs_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Report OVS bridge status
+      ansible.builtin.debug:
+        msg: |
+          OVS configured on {{ inventory_hostname }} ({{ ansible_distribution }})
+          Bridges: {{ _ovs_list.stdout_lines }}
+          {% for bridge in ovs_bridges %}
+          {{ bridge.name }}:
+            NIC       : {{ bridge.nic | default('(none — no physical uplink)') }}
+            Host IP   : {{ bridge.host_ip | default('(none)') }}
+            Gateway   : {{ bridge.gateway | default('(none)') }}
+          {% endfor %}

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Clear stale port_override entries from the UniFi Pro Max 16-Port.
+#
+# After deleting port profiles (e.g. management_only, pxe_host_trunk), any
+# switch port that still references the deleted portconf_id has a stale entry.
+# This script detects and optionally removes those anomalies.
+#
+# Usage:
+#   ./run              — dry-run: report anomalies, no changes
+#   ./run --fix        — apply: remove stale portconf_id references via API
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "$GIT_ROOT/set_env.sh"
+# shellcheck source=/dev/null
+source "$_UTILITIES_DIR/bash/init.sh"
+
+# Reuse the verify-unifi-networking venv (Ansible already installed there).
+VENV_BASE="$_INFRA_DIR/maas-pkg/_tg_scripts/maas/configure-server"
+# shellcheck source=/dev/null
+_activate_ansible_locally "$VENV_BASE"
+
+INVENTORY="$_DYNAMIC_DIR/ansible/inventory/hosts.yml"
+if [[ ! -f "$INVENTORY" ]]; then
+  echo "Regenerating Ansible inventory..."
+  "$_GENERATE_INVENTORY" --test
+fi
+
+export ANSIBLE_HOST_KEY_CHECKING=False
+export ANSIBLE_PYTHON_INTERPRETER=auto
+
+FIX_FLAG=""
+for arg in "$@"; do
+  if [[ "$arg" == "--fix" ]]; then
+    FIX_FLAG="--extra-vars fix=true"
+    break
+  fi
+done
+
+echo "=== Clear UniFi Pro Max port-override anomalies ==="
+if [[ -z "$FIX_FLAG" ]]; then
+  echo "(dry-run — pass --fix to apply changes)"
+fi
+echo ""
+
+ansible-playbook \
+  --inventory "$INVENTORY" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  $FIX_FLAG

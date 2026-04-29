@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Destroy UniFi resources managed by unifi-pkg (VLANs, port profiles, device
+# port overrides) via the UniFi controller API.
+#
+# Use when 'make clean-all' or 'terragrunt destroy' cannot reach the controller
+# or when state has been wiped but the resources still exist on the controller.
+#
+# Only deletes resources whose names / VLAN IDs are defined in unifi-pkg.yaml —
+# resources that were created outside this codebase are left untouched.
+#
+# Usage:
+#   ./run           Dry-run: show what would be deleted (default)
+#   ./run --apply   Actually delete the resources
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=/dev/null
+. "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+
+VENV_BASE="$SCRIPT_DIR"
+_activate_ansible_locally "$VENV_BASE"
+
+pip install pyyaml --quiet
+
+DRY_RUN="true"
+if [[ "${1:-}" == "--apply" ]]; then
+    DRY_RUN="false"
+fi
+
+echo "=== Destroy UniFi resources managed by unifi-pkg ==="
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "(DRY-RUN — pass --apply to actually delete)"
+fi
+echo ""
+
+GIT_ROOT="$GIT_ROOT" \
+DRY_RUN="$DRY_RUN" \
+_INFRA_DIR="$_INFRA_DIR" \
+    python3 "$SCRIPT_DIR/destroy_unifi_resources.py"

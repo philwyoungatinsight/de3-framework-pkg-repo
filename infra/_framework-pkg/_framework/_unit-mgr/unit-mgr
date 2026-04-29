@@ -1,0 +1,42 @@
+#!/bin/bash
+
+################################################################################
+# Boiler plate
+################################################################################
+
+#set -x
+
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+# Set Config variables
+. $(git rev-parse --show-toplevel)/set_env.sh
+
+# Path to this script
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Utility functions
+. $_UTILITIES_DIR/bash/init.sh
+
+################################################################################
+# Use our own Python (not the OS)
+################################################################################
+
+export PYTHON_VERSION='python3.12'
+
+setup_python() {
+    VENV_PARENT_DIR="$SCRIPT_DIR"
+    _activate_python_locally "$VENV_PARENT_DIR"
+}
+
+################################################################################
+# Entry point — pass all args to main.py
+################################################################################
+
+setup_python
+cd "${SCRIPT_DIR}" && exec python3 -m unit_mgr.main "$@"

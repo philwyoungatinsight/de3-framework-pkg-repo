@@ -1,0 +1,287 @@
+#!/bin/bash
+# _framework-pkg setup — installs common tools required by all packages.
+# Idempotent: checks whether each tool is present before installing.
+# Supports macOS (Homebrew), Debian/Ubuntu (apt), and Fedora/RHEL (dnf).
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+_INSTALL_REQS="$_UTILITIES_DIR/python/install-requirements.sh"
+
+# ── version pins ───────────────────────────────────────────────────────────────
+_YQ_VERSION="v4.44.3"
+_SOPS_VERSION="3.9.4"
+_OPENTOFU_VERSION="1.11.5"
+_TERRAGRUNT_VERSION="0.99.4"
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+_os() {
+    uname -s | tr '[:upper:]' '[:lower:]'
+}
+
+_arch() {
+    local a
+    a="$(uname -m)"
+    case "$a" in
+        x86_64)          echo "amd64" ;;
+        aarch64 | arm64) echo "arm64" ;;
+        *)               echo "$a" ;;
+    esac
+}
+
+_is_debian() {
+    [ -f /etc/debian_version ]
+}
+
+_has_brew() {
+    command -v brew >/dev/null 2>&1
+}
+
+_has_dnf() {
+    command -v dnf >/dev/null 2>&1
+}
+
+# ── jq ────────────────────────────────────────────────────────────────────────
+# https://github.com/jqlang/jq
+_setup_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        echo "  jq: $(jq --version 2>&1)"
+        return
+    fi
+    echo "==> Installing jq..."
+    if _has_brew; then
+        brew install jq
+    elif _is_debian; then
+        sudo apt-get install -y jq
+    elif _has_dnf; then
+        sudo dnf install -y jq
+    else
+        echo "ERROR: unsupported platform for automatic jq install." >&2
+        echo "       Install manually: https://jqlang.github.io/jq/download/" >&2
+        exit 1
+    fi
+    echo "  jq installed: $(jq --version 2>&1)"
+}
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+# https://docs.astral.sh/uv/
+_setup_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        echo "  uv: $(uv --version)"
+        return
+    fi
+    echo "==> Installing uv..."
+    if _has_brew; then
+        brew install uv
+    else
+        # Official installer — places uv in ~/.local/bin
+        curl -fsSL https://astral.sh/uv/install.sh | sh
+        export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+    fi
+    echo "  uv installed: $(uv --version 2>&1)"
+}
+
+# ── python3 ───────────────────────────────────────────────────────────────────
+# Installs python3 and required packages (pyyaml, packaging) used by the run script.
+_setup_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "==> Installing python3..."
+        if _has_brew; then
+            brew install python3
+        elif _is_debian; then
+            sudo apt-get install -y python3 python3-pip
+        elif _has_dnf; then
+            sudo dnf install -y python3 python3-pip
+        else
+            echo "ERROR: python3 not found and unsupported platform." >&2
+            exit 1
+        fi
+    fi
+    echo "  python3: $(python3 --version 2>&1)"
+    echo "==> Installing Python packages..."
+    "$_INSTALL_REQS" "$GIT_ROOT/infra/_framework-pkg/_setup/requirements.txt"
+}
+
+# ── yq (Mike Farrah's YAML CLI) ───────────────────────────────────────────────
+# https://github.com/mikefarah/yq
+_setup_yq() {
+    if command -v yq >/dev/null 2>&1; then
+        echo "  yq: $(yq --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing yq ${_YQ_VERSION}..."
+    if _has_brew; then
+        brew install yq
+    elif _is_debian; then
+        local deb="yq_linux_$(_arch).deb"
+        curl -fsSL -o "/tmp/$deb" \
+            "https://github.com/mikefarah/yq/releases/download/${_YQ_VERSION}/yq_linux_$(_arch).deb"
+        sudo dpkg -i "/tmp/$deb"
+        rm -f "/tmp/$deb"
+    else
+        # Fedora/RHEL and other Linux: download binary directly
+        local bin="yq_$(_os)_$(_arch)"
+        sudo curl -fsSL -o /usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${_YQ_VERSION}/${bin}"
+        sudo chmod +x /usr/local/bin/yq
+    fi
+    echo "  yq installed: $(yq --version 2>&1 | head -1)"
+}
+
+# ── sops (secrets decryption) ─────────────────────────────────────────────────
+# https://github.com/getsops/sops
+_setup_sops() {
+    if command -v sops >/dev/null 2>&1; then
+        echo "  sops: $(sops --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing sops v${_SOPS_VERSION}..."
+    if _has_brew; then
+        brew install sops
+    elif _is_debian; then
+        local arch
+        arch="$(dpkg --print-architecture)"
+        local deb="sops_${_SOPS_VERSION}_${arch}.deb"
+        curl -fsSL -o "/tmp/$deb" \
+            "https://github.com/getsops/sops/releases/download/v${_SOPS_VERSION}/${deb}"
+        sudo dpkg -i "/tmp/$deb"
+        rm -f "/tmp/$deb"
+    elif _has_dnf; then
+        local rpm="sops-${_SOPS_VERSION}-1.$(_arch).rpm"
+        curl -fsSL -o "/tmp/${rpm}" \
+            "https://github.com/getsops/sops/releases/download/v${_SOPS_VERSION}/${rpm}" 2>/dev/null || {
+            # Fallback: binary download if RPM not available for this arch
+            local bin="sops-v${_SOPS_VERSION}.$(_os).$(_arch)"
+            sudo curl -fsSL -o /usr/local/bin/sops \
+                "https://github.com/getsops/sops/releases/download/v${_SOPS_VERSION}/${bin}"
+            sudo chmod +x /usr/local/bin/sops
+            echo "  sops installed: $(sops --version 2>&1 | head -1)"
+            return
+        }
+        sudo rpm -i "/tmp/${rpm}"
+        rm -f "/tmp/${rpm}"
+    else
+        local bin="sops-v${_SOPS_VERSION}.$(_os).$(_arch)"
+        sudo curl -fsSL -o /usr/local/bin/sops \
+            "https://github.com/getsops/sops/releases/download/v${_SOPS_VERSION}/${bin}"
+        sudo chmod +x /usr/local/bin/sops
+    fi
+    echo "  sops installed: $(sops --version 2>&1 | head -1)"
+}
+
+# ── OpenTofu ──────────────────────────────────────────────────────────────────
+# https://opentofu.org/docs/intro/install/
+_setup_opentofu() {
+    if command -v tofu >/dev/null 2>&1; then
+        echo "  tofu: $(tofu version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing OpenTofu v${_OPENTOFU_VERSION}..."
+    if _has_brew; then
+        brew install opentofu
+    elif _is_debian; then
+        # Use the official OpenTofu install script (handles apt repo setup)
+        curl -fsSL https://get.opentofu.org/install-opentofu.sh \
+            | sudo sh -s -- --install-method deb
+    elif _has_dnf; then
+        curl -fsSL https://get.opentofu.org/install-opentofu.sh \
+            | sudo sh -s -- --install-method rpm
+    else
+        # Generic binary download
+        local zip="tofu_${_OPENTOFU_VERSION}_$(_os)_$(_arch).zip"
+        curl -fsSL -o "/tmp/${zip}" \
+            "https://github.com/opentofu/opentofu/releases/download/v${_OPENTOFU_VERSION}/${zip}"
+        sudo unzip -o "/tmp/${zip}" tofu -d /usr/local/bin
+        sudo chmod +x /usr/local/bin/tofu
+        rm -f "/tmp/${zip}"
+    fi
+    echo "  tofu installed: $(tofu version 2>&1 | head -1)"
+}
+
+# ── Terragrunt ────────────────────────────────────────────────────────────────
+# https://terragrunt.gruntwork.io/docs/getting-started/install/
+_setup_terragrunt() {
+    if command -v terragrunt >/dev/null 2>&1; then
+        echo "  terragrunt: $(terragrunt --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing Terragrunt v${_TERRAGRUNT_VERSION}..."
+    if _has_brew; then
+        brew install terragrunt
+    else
+        # All Linux platforms: download binary from GitHub releases
+        local bin="terragrunt_$(_os)_$(_arch)"
+        sudo curl -fsSL -o /usr/local/bin/terragrunt \
+            "https://github.com/gruntwork-io/terragrunt/releases/download/v${_TERRAGRUNT_VERSION}/${bin}"
+        sudo chmod +x /usr/local/bin/terragrunt
+    fi
+    echo "  terragrunt installed: $(terragrunt --version 2>&1 | head -1)"
+}
+
+# ── kubectl ───────────────────────────────────────────────────────────────────
+# https://kubernetes.io/docs/tasks/tools/
+_setup_kubectl() {
+    if command -v kubectl >/dev/null 2>&1; then
+        echo "  kubectl: $(kubectl version --client 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing kubectl..."
+    if _has_brew; then
+        brew install kubectl
+    elif _is_debian; then
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /' \
+            | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        sudo apt-get update -qq && sudo apt-get install -y kubectl
+    elif _has_dnf; then
+        cat <<'EOF' | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.32/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.32/rpm/repodata/repomd.xml.key
+EOF
+        sudo dnf install -y kubectl
+    else
+        local ver
+        ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+        sudo curl -fsSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${ver}/bin/$(_os)/$(_arch)/kubectl"
+        sudo chmod +x /usr/local/bin/kubectl
+    fi
+    echo "  kubectl installed: $(kubectl version --client 2>&1 | head -1)"
+}
+
+# ── helm ──────────────────────────────────────────────────────────────────────
+# https://helm.sh/docs/intro/install/
+_setup_helm() {
+    if command -v helm >/dev/null 2>&1; then
+        echo "  helm: $(helm version --short 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing helm..."
+    if _has_brew; then
+        brew install helm
+    else
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    fi
+    echo "  helm installed: $(helm version --short 2>&1 | head -1)"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────
+echo "=== _framework-pkg setup ==="
+_setup_jq
+_setup_uv
+_setup_python3
+_setup_yq
+_setup_sops
+_setup_opentofu
+_setup_terragrunt
+_setup_kubectl
+_setup_helm
+echo "=== _framework-pkg setup complete ==="

@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""fw-repo-mgr — Framework Repository Manager
+
+Creates and maintains de3 framework ecosystem repos from a template source repo.
+Configuration is read from framework_repo_manager.yaml via 3-tier lookup:
+  1. $GIT_ROOT/config/framework_repo_manager.yaml              (ad-hoc override)
+  2. $_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/ (main package)
+  3. $_FRAMEWORK_PKG_DIR/_config/_framework_settings/          (framework default)
+"""
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from typing import Optional
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("ERROR: PyYAML not found. Run: pip install pyyaml")
+
+
+# ─── Bootstrap ────────────────────────────────────────────────────────────────
+
+def _git_root() -> str:
+    # Prefer $_GIT_ROOT already in the environment (parent shell sourced set_env.sh).
+    # This is authoritative and avoids the symlink-resolution problem: os.getcwd() and
+    # git both resolve to the physical framework repo, not the consumer repo.
+    if os.environ.get("_GIT_ROOT"):
+        return os.environ["_GIT_ROOT"]
+    # Walk up from logical $PWD (shell's unresolved path) as a fallback.
+    pwd = pathlib.Path(os.environ.get("PWD") or os.getcwd())
+    p = pwd
+    while True:
+        if (p / ".git").exists():
+            return str(p)
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    sys.exit("FATAL: not inside a git repository.")
+
+
+def _source_set_env(git_root: str) -> None:
+    """Ensure framework environment variables are available in os.environ.
+
+    If the parent shell already sourced set_env.sh (_GIT_ROOT and _FRAMEWORK_PKG_DIR
+    are present), re-use those vars directly.  Spawning a subprocess would call
+    git rev-parse inside set_env.sh, resolve symlinks, and find the physical
+    framework repo instead of the consumer repo — setting _FRAMEWORK_MAIN_PACKAGE_DIR
+    to the wrong location.
+    """
+    if os.environ.get("_GIT_ROOT") and os.environ.get("_FRAMEWORK_PKG_DIR"):
+        return
+    set_env = pathlib.Path(git_root) / "set_env.sh"
+    if not set_env.exists():
+        sys.exit(f"FATAL: {set_env} not found.")
+    # Use ; not && so env -0 runs even if startup checks (gpg-mgr, config-mgr) fail.
+    result = subprocess.run(
+        ["bash", "-c", f'source "{set_env}"; env -0'],
+        stdout=subprocess.PIPE,
+    )
+    for item in result.stdout.decode(errors="replace").split("\0"):
+        if "=" in item:
+            k, _, v = item.partition("=")
+            if k:
+                os.environ[k] = v
+
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+_CFG_FNAME      = "framework_repo_manager.yaml"
+_PKG_MGMT_FNAME = "framework_package_management.yaml"
+
+
+class Config:
+    """3-tier config lookup and typed accessors for framework_repo_manager.yaml."""
+
+    def __init__(self, git_root: str) -> None:
+        self.git_root   = pathlib.Path(git_root)
+        self._path_loaded = False
+        self._path: Optional[pathlib.Path] = None
+        self._data: Optional[dict]         = None
+
+    @property
+    def path(self) -> Optional[pathlib.Path]:
+        if self._path_loaded:
+            return self._path
+        self._path_loaded = True
+        fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+        fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
+        candidates = [
+            self.git_root / "config" / _CFG_FNAME,
+            pathlib.Path(fw_main) / "_config" / "_framework_settings" / _CFG_FNAME
+                if fw_main else None,
+            pathlib.Path(fw_pkg) / "_config" / "_framework_settings" / _CFG_FNAME
+                if fw_pkg else None,
+        ]
+        for c in candidates:
+            if c and c.exists():
+                self._path = c
+                return c
+        return None
+
+    @property
+    def data(self) -> dict:
+        if self._data is None:
+            p = self.path
+            self._data = (yaml.safe_load(p.read_text()) or {}) if p else {}
+        return self._data
+
+    @property
+    def fm(self) -> dict:
+        return self.data.get("framework_repo_manager", {})
+
+    # ── Accessors ──────────────────────────────────────────────────────────
+
+    def fw_repo_base_dir(self) -> Optional[pathlib.Path]:
+        rel = self.fm.get("framework_repo_dir", "")
+        if not rel:
+            return None
+        home = pathlib.Path.home()
+        return home if rel == "." else (home / rel).resolve()
+
+    def list_repos(self) -> list:
+        return self.fm.get("framework_repos") or []
+
+    def repo(self, name: str) -> Optional[dict]:
+        return next((r for r in self.list_repos() if r.get("name") == name), None)
+
+    def resolve_source(self, name: str) -> tuple:
+        """Returns (url, ref)."""
+        defaults = {s["name"]: s for s in self.fm.get("source_repo_defaults") or []}
+        r = self.repo(name)
+        if not r:
+            return ("", "main")
+        src = r.get("source_repo") or {}
+        if isinstance(src, str):
+            src = {"name": src}
+        fallback = defaults.get(src.get("name", ""), {})
+        url = src.get("url") or fallback.get("url", "")
+        ref = src.get("ref") or fallback.get("ref", "main")
+        return (url, ref)
+
+    def resolve_remotes(self, name: str) -> list:
+        r = self.repo(name)
+        return (r.get("new_repo_config") or {}).get("git-remotes", []) if r else []
+
+    def config_package(self, name: str) -> str:
+        r = self.repo(name)
+        if not r:
+            return ""
+        if r.get("config_package"):
+            return r["config_package"]
+        return next(
+            (p["name"] for p in r.get("framework_packages", []) if p.get("is_main_package")),
+            ""
+        )
+
+    def ext_pkg_base(self) -> str:
+        fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+        fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
+        for candidate in [
+            self.git_root / "config" / _PKG_MGMT_FNAME,
+            pathlib.Path(fw_main) / "_config" / "_framework_settings" / _PKG_MGMT_FNAME
+                if fw_main else None,
+            pathlib.Path(fw_pkg) / "_config" / "_framework_settings" / _PKG_MGMT_FNAME
+                if fw_pkg else None,
+        ]:
+            if candidate and candidate.exists():
+                d = yaml.safe_load(candidate.read_text()) or {}
+                return d.get("framework_package_management", {}).get(
+                    "external_package_dir", "git/de3-ext-packages"
+                )
+        return "git/de3-ext-packages"
+
+    def find_source_clone(self, url: str, ref: str) -> Optional[pathlib.Path]:
+        slug = pathlib.Path(url.rstrip("/")).stem
+        p = pathlib.Path.home() / self.ext_pkg_base() / slug / ref
+        return p if (p / ".git").exists() else None
+
+
+# ─── Naming validation ────────────────────────────────────────────────────────
+
+def validate_naming_rules(cfg: Config, scope: str = "") -> None:
+    rules = cfg.fm.get("framework_package_naming_rules", [])
+    if not rules:
+        return
+
+    repos = [r for r in cfg.list_repos() if not scope or r.get("name") == scope]
+    repo_names       = [r.get("name", "") for r in repos]
+    embedded_pkgs, all_pkgs = [], []
+    for r in repos:
+        for p in r.get("framework_packages", []):
+            all_pkgs.append(p.get("name", ""))
+            if p.get("package_type") == "embedded":
+                embedded_pkgs.append(p.get("name", ""))
+
+    groups: dict = defaultdict(list)
+    for rule in rules:
+        groups[rule["name"]].append(rule["value"])
+
+    begin_vals = groups.pop("repo_names_must_begin_with", [])
+    end_vals   = groups.pop("repo_names_must_end_with",   [])
+    errors     = []
+
+    if begin_vals or end_vals:
+        for n in repo_names:
+            ok = any(n.startswith(str(v)) for v in begin_vals) or \
+                 any(n.endswith(str(v))   for v in end_vals)
+            if not ok:
+                parts = [f"begin with '{v}'" for v in begin_vals] + \
+                        [f"end with '{v}'"   for v in end_vals]
+                errors.append(f"repo name '{n}' must " + " or ".join(parts))
+
+    for rule_name, values in groups.items():
+        if rule_name == "repo_names_must_be_unique":
+            seen: dict = {}
+            for n in repo_names:
+                seen[n] = seen.get(n, 0) + 1
+            dupes = [n for n, c in seen.items() if c > 1]
+            if dupes:
+                errors.append(f"repo_names_must_be_unique: duplicate repo names: {dupes}")
+
+        elif rule_name == "repo_names_must_not_contain_special_chars":
+            for n in repo_names:
+                if not re.match(r"^[a-z0-9_][a-z0-9_-]*$", n):
+                    errors.append(
+                        f"repo_names_must_not_contain_special_chars: '{n}'"
+                        " (only a-z, 0-9, _, - allowed)"
+                    )
+
+        elif rule_name == "package_names_must_be_unique":
+            seen = {}
+            for n in embedded_pkgs:
+                seen[n] = seen.get(n, 0) + 1
+            dupes = [n for n, c in seen.items() if c > 1]
+            if dupes:
+                errors.append(f"package_names_must_be_unique: duplicate embedded: {dupes}")
+
+        elif rule_name == "package_names_must_be_valid_identifiers":
+            for n in all_pkgs:
+                if not n.endswith("-pkg"):
+                    errors.append(
+                        f"package_names_must_be_valid_identifiers: '{n}' must end in '-pkg'"
+                    )
+
+        elif rule_name == "package_names_must_not_contain_special_chars":
+            for n in all_pkgs:
+                if not re.match(r"^[a-z0-9_][a-z0-9_-]*$", n):
+                    errors.append(
+                        f"package_names_must_not_contain_special_chars: '{n}'"
+                        " (only a-z, 0-9, _, - allowed)"
+                    )
+
+        else:
+            errors.append(f"Unknown rule name: '{rule_name}'")
+
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ─── Remote repo creation ─────────────────────────────────────────────────────
+
+def _strip_host(url: str, prefixes: list) -> str:
+    for p in prefixes:
+        url = re.sub(p, "", url)
+    return re.sub(r"\.git$", "", url)
+
+
+def _ensure_github_repo(owner_repo: str) -> None:
+    if subprocess.run(["gh", "api", f"repos/{owner_repo}"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        print(f"  github: exists — {owner_repo}")
+        return
+    print(f"  github: creating {owner_repo} ...")
+    subprocess.run(["gh", "repo", "create", owner_repo, "--public"], check=True)
+    print(f"  github: created — {owner_repo}")
+
+
+def _ensure_gitlab_repo(ns_proj: str) -> None:
+    import urllib.parse
+    encoded = urllib.parse.quote(ns_proj, safe="")
+    if subprocess.run(["glab", "api", f"projects/{encoded}"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        print(f"  gitlab: exists — {ns_proj}")
+        return
+    namespace, _, project = ns_proj.partition("/")
+    print(f"  gitlab: creating {ns_proj} ...")
+    ns_enc = urllib.parse.quote(namespace)
+    r = subprocess.run(["glab", "api", f"namespaces?search={ns_enc}"],
+                       capture_output=True, text=True)
+    ns_id = ""
+    try:
+        items = json.loads(r.stdout)
+        if isinstance(items, list):
+            for ns in items:
+                if ns.get("path") == namespace or ns.get("name") == namespace:
+                    ns_id = str(ns["id"])
+                    break
+    except (json.JSONDecodeError, KeyError):
+        pass
+    args = ["glab", "api", "projects", "-X", "POST",
+            "-f", f"name={project}", "-f", "visibility=public"]
+    if ns_id:
+        args += ["-f", f"namespace_id={ns_id}"]
+    subprocess.run(args, stdout=subprocess.DEVNULL, check=True)
+    print(f"  gitlab: created — {ns_proj}")
+
+
+def _ensure_remote_repo(name: str, git_source: str) -> None:
+    if "github.com" in git_source:
+        _ensure_github_repo(_strip_host(git_source,
+            [r"^https://github\.com/", r"^git@github\.com:"]))
+    elif "gitlab.com" in git_source:
+        _ensure_gitlab_repo(_strip_host(git_source,
+            [r"^git@gitlab\.com:", r"^https://gitlab\.com/"]))
+    else:
+        print(f"  WARNING: unknown host in '{git_source}' — skipping remote repo creation")
+
+
+# ─── Build helpers ────────────────────────────────────────────────────────────
+
+def _git(repo_dir: pathlib.Path, *args, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo_dir)] + list(args), **kwargs)
+
+
+def _git_ok(repo_dir: pathlib.Path, *args) -> bool:
+    return _git(repo_dir, *args,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def prune_infra(repo_dir: pathlib.Path, repo_name: str, cfg: Config) -> None:
+    r = cfg.repo(repo_name)
+    keep = {p["name"] for p in (r.get("framework_packages", []) if r else [])
+            if p.get("package_type") == "embedded"}
+    infra = repo_dir / "infra"
+    if not infra.exists():
+        return
+    for entry in infra.iterdir():
+        if not entry.is_symlink() and entry.is_dir() and entry.name not in keep:
+            print(f"  prune: infra/{entry.name}")
+            shutil.rmtree(entry)
+
+
+def write_framework_packages_yaml(
+    repo_name: str, out_path: pathlib.Path, cfg: Config
+) -> None:
+    r    = cfg.repo(repo_name)
+    pkgs = list(r.get("framework_packages", []) if r else [])
+    tmpl = cfg.fm.get("framework_package_template")
+    if tmpl and tmpl.get("name") not in {p["name"] for p in pkgs}:
+        pkgs = [tmpl] + pkgs
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        yaml.dump({"framework_packages": pkgs}, default_flow_style=False, sort_keys=False)
+    )
+
+
+def write_config_framework_yaml(repo_dir: pathlib.Path, config_pkg: str) -> None:
+    (repo_dir / "config").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "config" / "_framework.yaml").write_text(
+        f"_framework:\n  main_package: {config_pkg}\n"
+    )
+    print(f"  wrote: config/_framework.yaml (main_package: {config_pkg})")
+
+
+def copy_framework_settings(repo_dir: pathlib.Path, config_pkg: str) -> None:
+    settings_dir = repo_dir / "infra" / config_pkg / "_config" / "_framework_settings"
+    skip_re = re.compile(
+        r"^(framework_packages|framework_package_repositories|"
+        r"framework_package_management|framework_repo_manager)\.yaml$"
+    )
+    fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
+    fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    seen: set = set()
+    src_dirs = []
+    for base in [fw_pkg, fw_main]:
+        if base:
+            d = pathlib.Path(base) / "_config" / "_framework_settings"
+            if d.exists() and str(d) not in seen:
+                src_dirs.append(d)
+                seen.add(str(d))
+    copied = 0
+    for src_dir in src_dirs:
+        for f in src_dir.glob("*.yaml"):
+            if not skip_re.match(f.name):
+                shutil.copy2(f, settings_dir / f.name)
+                copied += 1
+    print(
+        f"  copied: {copied} framework settings file(s) → "
+        f"infra/{config_pkg}/_config/_framework_settings/"
+    )
+
+
+def write_settings_template(
+    repo_dir: pathlib.Path, config_pkg: str, cfg: Config
+) -> None:
+    template    = cfg.fm.get("framework_settings_template") or {}
+    settings_dir = repo_dir / "infra" / config_pkg / "_config" / "_framework_settings"
+    for key, value in template.items():
+        (settings_dir / f"{key}.yaml").write_text(
+            yaml.dump({key: value}, default_flow_style=False, sort_keys=False)
+        )
+        print(f"  template: {key}.yaml")
+
+
+def write_sops_yaml(repo_dir: pathlib.Path, repo_name: str, cfg: Config) -> None:
+    templates = cfg.fm.get("framework_settings_sops_templates") or []
+    if not templates:
+        return
+    r     = cfg.repo(repo_name)
+    tname = r.get("sops-template", "default") if r else "default"
+    entry = next((t for t in templates if t.get("name") == tname), None)
+    if entry is None:
+        sys.exit(
+            f"ERROR: sops template '{tname}' not found in "
+            f"framework_settings_sops_templates (repo: {repo_name})"
+        )
+    (repo_dir / ".sops.yaml").write_text(
+        yaml.dump(
+            {k: v for k, v in entry.items() if k != "name"},
+            default_flow_style=False, sort_keys=False,
+        )
+    )
+    print(f"  wrote: .sops.yaml ({tname})")
+
+
+def write_minimal_framework_settings(
+    repo_name: str, repo_dir: pathlib.Path, config_pkg: str, cfg: Config
+) -> None:
+    settings_dir = repo_dir / "infra" / config_pkg / "_config" / "_framework_settings"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+
+    source_url, _ = cfg.resolve_source(repo_name)
+    (settings_dir / "framework_package_repositories.yaml").write_text(
+        f"framework_package_repositories:\n  - name: de3-runner\n    url: {source_url}\n"
+    )
+
+    fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
+    for base in [fw_main, fw_pkg]:
+        if not base:
+            continue
+        src = pathlib.Path(base) / "_config" / "_framework_settings" / _PKG_MGMT_FNAME
+        if src.exists():
+            shutil.copy2(src, settings_dir / _PKG_MGMT_FNAME)
+            break
+
+    print(
+        f"  wrote: infra/{config_pkg}/_config/_framework_settings/"
+        "{framework_package_repositories,framework_package_management}.yaml"
+    )
+
+
+# ─── Build ────────────────────────────────────────────────────────────────────
+
+def build_repo(repo_name: str, force_push: bool, cfg: Config) -> None:
+    repo_base = cfg.fw_repo_base_dir()
+    if not repo_base:
+        sys.exit(f"ERROR: framework_repo_dir not set in {cfg.path}")
+
+    validate_naming_rules(cfg, repo_name)
+
+    repo_dir   = repo_base / repo_name
+    source_url, source_ref = cfg.resolve_source(repo_name)
+    if not source_url:
+        sys.exit(f"ERROR: no source_repo or source_url for '{repo_name}'")
+
+    # Step 1 — initialise or update
+    if not (repo_dir / ".git").exists():
+        print(f"Initialising {repo_dir} from {source_url} ({source_ref}) ...")
+        src_dir = cfg.find_source_clone(source_url, source_ref)
+        tmp_dir = None
+        if src_dir is None:
+            tmp_dir = pathlib.Path(tempfile.mkdtemp())
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", source_ref,
+                 source_url, str(tmp_dir)],
+                check=True,
+            )
+            src_dir = tmp_dir
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["rsync", "-a", "--exclude=.git", f"{src_dir}/", f"{repo_dir}/"], check=True
+        )
+        if tmp_dir:
+            shutil.rmtree(tmp_dir)
+        subprocess.run(["git", "-C", str(repo_dir), "init", "-b", "main"], check=True)
+    else:
+        r   = cfg.repo(repo_name)
+        src = r.get("source_repo") or {} if r else {}
+        if isinstance(src, str):
+            src = {"name": src}
+        source_remote = src.get("name") or "source"
+        fetch_remote  = source_remote if _git_ok(repo_dir, "remote", "get-url", source_remote) \
+                        else "origin"
+        print(f"Updating {repo_dir} ...")
+        if _git_ok(repo_dir, "remote", "get-url", fetch_remote):
+            _git(repo_dir, "fetch", fetch_remote, check=True)
+            _git(repo_dir, "checkout", source_ref, check=True)
+            _git(repo_dir, "pull", "--ff-only", fetch_remote, source_ref, check=False)
+        else:
+            print("  (no remote configured — repo is local-only, skipping fetch)")
+
+    # Step 2 — prune infra/
+    print("Pruning infra/ to target package list ...")
+    prune_infra(repo_dir, repo_name, cfg)
+
+    # Step 3 — scaffolding
+    config_pkg = cfg.config_package(repo_name)
+    if config_pkg:
+        write_config_framework_yaml(repo_dir, config_pkg)
+        write_minimal_framework_settings(repo_name, repo_dir, config_pkg, cfg)
+        copy_framework_settings(repo_dir, config_pkg)
+        write_settings_template(repo_dir, config_pkg, cfg)
+        fw_pkgs_out = (
+            repo_dir / "infra" / config_pkg / "_config"
+            / "_framework_settings" / "framework_packages.yaml"
+        )
+    else:
+        fw_pkgs_out = (
+            repo_dir / "infra" / "_framework-pkg" / "_config" / "framework_packages.yaml"
+        )
+        fw_pkgs_out.parent.mkdir(parents=True, exist_ok=True)
+
+    write_framework_packages_yaml(repo_name, fw_pkgs_out, cfg)
+    print(f"Wrote: {fw_pkgs_out}")
+    write_sops_yaml(repo_dir, repo_name, cfg)
+
+    # Re-encrypt SOPS files via sops-mgr (not sops directly — keeps re-encryption traceable)
+    print(f"Re-encrypting SOPS files in {repo_dir} ...")
+    subprocess.run(
+        [_env("_SOPS_MGR"), "--re-encrypt", "--infra-dir", str(repo_dir / "infra")],
+        check=True,
+    )
+
+    # Step 4 — pkg-mgr sync
+    print(f"Running pkg-mgr sync in {repo_dir} ...")
+    pkg_mgr = _env("_PKG_MGR")
+    if config_pkg:
+        # _framework-pkg was pruned (it's external), so set_env.sh symlink is dangling.
+        # Install a minimal shim so pkg-mgr can source it, then restore the original symlink.
+        set_env_link    = repo_dir / "set_env.sh"
+        original_target = os.readlink(set_env_link) if set_env_link.is_symlink() else None
+        set_env_link.unlink(missing_ok=True)
+        set_env_link.write_text(
+            "#!/bin/bash\n"
+            '_SHIM_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"\n'
+            f'export _FRAMEWORK_PKG_DIR="$_SHIM_ROOT/infra/_framework-pkg"\n'
+            f'export _FRAMEWORK_MAIN_PACKAGE="{config_pkg}"\n'
+            f'export _FRAMEWORK_MAIN_PACKAGE_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
+            f'export _FRAMEWORK_CONFIG_PKG="{config_pkg}"\n'
+            f'export _FRAMEWORK_CONFIG_PKG_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
+            'export _GCS_BUCKET=""\n'
+            'export _CONFIG_TMP_DIR="$_SHIM_ROOT/config/tmp"\n'
+            'export _DYNAMIC_DIR="$_SHIM_ROOT/config/tmp/dynamic"\n'
+        )
+        set_env_link.chmod(0o755)
+        subprocess.run(
+            [pkg_mgr, "--sync"], cwd=str(repo_dir),
+            env={**os.environ, "_FRAMEWORK_MAIN_PACKAGE": config_pkg},
+            check=True,
+        )
+        set_env_link.unlink(missing_ok=True)
+        if original_target:
+            os.symlink(original_target, set_env_link)
+    else:
+        subprocess.run(
+            ["bash", "-c", f'source ./set_env.sh && "{pkg_mgr}" --sync'],
+            cwd=str(repo_dir), check=True,
+        )
+
+    # Step 5 — commit
+    subprocess.run(["git", "-C", str(repo_dir), "add", "-A"], check=True)
+    if subprocess.run(["git", "-C", str(repo_dir), "diff", "--cached", "--quiet"],
+                      capture_output=True).returncode != 0:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-m",
+             f"chore(fw-repo-mgr): update packages for {repo_name}"],
+            check=True,
+        )
+    else:
+        print(f"Nothing to commit in {repo_dir}")
+
+    # Step 6 — push
+    r = cfg.repo(repo_name)
+    if r and r.get("local_only"):
+        print(f"Skipping remote push: {repo_name} has local_only: true")
+        print(f"  Validate the local repo at {repo_dir}, "
+              "then remove local_only: true and re-run to push.")
+        print(f"Done: {repo_name} → {repo_dir}")
+        return
+
+    remotes = cfg.resolve_remotes(repo_name)
+    if remotes:
+        print("Ensuring remote repos exist ...")
+        for remote in remotes:
+            if remote.get("git-source"):
+                _ensure_remote_repo(remote.get("name", ""), remote["git-source"])
+
+    for remote in remotes:
+        remote_name = remote.get("name", "")
+        git_source  = remote.get("git-source", "")
+        git_ref     = remote.get("git-ref", "main")
+        if not git_source:
+            continue
+        cur = subprocess.run(
+            ["git", "-C", str(repo_dir), "remote", "get-url", remote_name],
+            capture_output=True, text=True,
+        )
+        if cur.returncode != 0:
+            _git(repo_dir, "remote", "add", remote_name, git_source, check=True)
+        elif cur.stdout.strip() != git_source:
+            _git(repo_dir, "remote", "set-url", remote_name, git_source, check=True)
+        push = ["git", "-C", str(repo_dir), "push"]
+        if force_push:
+            push.append("--force")
+        push += ["-u", remote_name, git_ref]
+        subprocess.run(push, check=True)
+        print(f"Pushed: {repo_name} → {git_source} ({git_ref}) via {remote_name}")
+
+    print(f"Done: {repo_name} → {repo_dir}")
+
+
+# ─── Status ───────────────────────────────────────────────────────────────────
+
+def _check_remotes_exist(remotes: list) -> Optional[bool]:
+    """Return True if all remote URLs respond, False if any fail, None if no remotes."""
+    urls = [r.get("git-source", "") for r in remotes if r.get("git-source")]
+    if not urls:
+        return None
+    for url in urls:
+        r = subprocess.run(
+            ["git", "ls-remote", "--exit-code", "--quiet", url, "HEAD"],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            return False
+    return True
+
+
+def _get_git_status(repo_dir: pathlib.Path) -> str:
+    """Fetch from all remotes then return a status string for the local repo."""
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "fetch", "--all", "--quiet"],
+        capture_output=True,
+    )
+    r = subprocess.run(
+        ["git", "-C", str(repo_dir), "status", "--porcelain=v2", "--branch"],
+        capture_output=True, text=True,
+    )
+    ahead = behind = 0
+    dirty = False
+    for line in r.stdout.splitlines():
+        if line.startswith("# branch.ab "):
+            parts = line.split()
+            if len(parts) >= 4:
+                ahead  = int(parts[2].lstrip("+"))
+                behind = int(parts[3].lstrip("-"))
+        elif not line.startswith("#"):
+            dirty = True
+    parts = []
+    if dirty:
+        parts.append("dirty")
+    if ahead:
+        parts.append(f"+{ahead}")
+    if behind:
+        parts.append(f"-{behind}")
+    return " ".join(parts) if parts else "clean"
+
+
+def status_cmd(cfg: Config, fmt: Optional[str] = None) -> None:
+    repo_base = cfg.fw_repo_base_dir()
+    rows = []
+    for r in cfg.list_repos():
+        name       = r.get("name", "")
+        pkgs       = len(r.get("framework_packages", []))
+        remotes    = (r.get("new_repo_config") or {}).get("git-remotes", [])
+        upstream   = remotes[0].get("git-source", "") if remotes else ""
+        upstream   = upstream.replace("https://github.com/", "github.com/")
+        local_only = bool(r.get("local_only"))
+        repo_dir   = repo_base / name if repo_base else pathlib.Path(name)
+
+        local_dir_exists = (repo_dir / ".git").exists()
+        all_remotes_exist = None if local_only else _check_remotes_exist(remotes)
+        git_status = _get_git_status(repo_dir) if local_dir_exists else "not cloned"
+
+        rows.append({
+            "name":             name,
+            "local_path":       str(repo_dir).replace(str(pathlib.Path.home()), "~"),
+            "packages":         pkgs,
+            "upstream":         upstream,
+            "local_only":       local_only,
+            "local_dir_exists": local_dir_exists,
+            "all_remotes_exist": all_remotes_exist,
+            "git_status":       git_status,
+        })
+
+    if fmt == "json":
+        print(json.dumps(rows, indent=2))
+    elif fmt == "yaml":
+        print(yaml.dump(rows, default_flow_style=False, sort_keys=False), end="")
+    else:
+        def _yn(val: Optional[bool]) -> str:
+            if val is None: return "—"
+            return "✓" if val else "✗"
+
+        print(f"{'NAME':<30} {'LOCAL':<6} {'REMOTES':<8} {'GIT STATUS':<22} UPSTREAM")
+        print(f"{'----':<30} {'-----':<6} {'-------':<8} {'----------':<22} --------")
+        for row in rows:
+            st = row["git_status"]
+            if row["local_only"]:
+                st += " (local-only)"
+            print(
+                f"{row['name']:<30} {_yn(row['local_dir_exists']):<6} "
+                f"{_yn(row['all_remotes_exist']):<8} {st:<22} {row['upstream']}"
+            )
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+USAGE = """\
+fw-repo-mgr — framework repository manager
+
+Usage:
+  fw-repo-mgr -b|--build [<name>] [-F|--force-push]    Build/sync all or named target repo
+  fw-repo-mgr -v|--validate [<name>]                    Validate naming rules (all or named)
+  fw-repo-mgr -s|--status [-f|--format json|yaml] [-j|-y] Show state of all configured repos
+  fw-repo-mgr -h|--help                                 Show this message
+
+Workflow:
+  1. Add entries to framework_repo_manager.yaml (source_repo_defaults + framework_repos)
+  2. fw-repo-mgr --build <name>   → clone source, prune, update packages, sync, commit, push
+
+config_package support:
+  Set config_package: <pkg> on a repo entry so the tool writes:
+    config/_framework.yaml           (sets _FRAMEWORK_MAIN_PACKAGE)
+    infra/<pkg>/_config/_framework_settings/framework_packages.yaml
+    infra/<pkg>/_config/_framework_settings/framework_package_repositories.yaml
+    infra/<pkg>/_config/_framework_settings/framework_package_management.yaml
+
+local_only support:
+  Set local_only: true to build the repo locally without pushing to any remote.
+  Remove the flag and re-run fw-repo-mgr --build to create remotes and push.
+"""
+
+
+def main() -> None:
+    # Handle --help before bootstrapping (no set_env.sh needed)
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(USAGE, end="")
+        sys.exit(0 if len(sys.argv) > 1 else 1)
+
+    git_root = _git_root()
+    _source_set_env(git_root)
+
+    vc = pathlib.Path(_env("_UTILITIES_DIR")) / "python" / "validate-config.py"
+    if vc.exists():
+        subprocess.run(["python3", str(vc)], stderr=sys.stderr, check=False)
+
+    cfg = Config(git_root)
+
+    cmd:        Optional[str] = None
+    force_push: bool          = False
+    repo_name:  str           = ""
+    fmt:        Optional[str] = None
+
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if   a in ("-b", "--build"):      cmd = "build"
+        elif a in ("-v", "--validate"):   cmd = "validate"
+        elif a in ("-s", "--status"):     cmd = "status"
+        elif a in ("-F", "--force-push"): force_push = True
+        elif a == "-j":                   fmt = "json"
+        elif a == "-y":                   fmt = "yaml"
+        elif a in ("-f", "--format"):
+            i += 1
+            if i >= len(sys.argv):
+                sys.exit("ERROR: --format requires an argument (json or yaml)")
+            fmt = sys.argv[i]
+            if fmt not in ("json", "yaml"):
+                sys.exit(f"ERROR: --format must be 'json' or 'yaml', got '{fmt}'")
+        elif a in ("-h", "--help"):
+            print(USAGE, end=""); sys.exit(0)
+        elif a.startswith("-"):
+            print(f"ERROR: unknown flag {a}", file=sys.stderr)
+            print(USAGE, end="", file=sys.stderr)
+            sys.exit(1)
+        else:
+            repo_name = a
+        i += 1
+
+    if cmd is None:
+        print(USAGE, end="", file=sys.stderr)
+        sys.exit(1)
+
+    if cmd == "build":
+        names = [repo_name] if repo_name else [r["name"] for r in cfg.list_repos()]
+        for name in names:
+            build_repo(name, force_push, cfg)
+    elif cmd == "validate":
+        validate_naming_rules(cfg, repo_name)
+        print("Naming rules OK.")
+    elif cmd == "status":
+        status_cmd(cfg, fmt)
+
+
+if __name__ == "__main__":
+    main()

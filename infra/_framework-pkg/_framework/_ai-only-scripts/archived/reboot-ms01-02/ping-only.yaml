@@ -1,0 +1,14 @@
+---
+- name: Check if ms01-02 is back up
+  hosts: ms01-02
+  gather_facts: false
+  tasks:
+    - name: Ping ms01-02
+      ansible.builtin.ping:
+    - name: Get uptime
+      ansible.builtin.shell: uptime
+      changed_when: false
+      register: _uptime
+    - name: Show uptime
+      ansible.builtin.debug:
+        msg: "ms01-02 is UP: {{ _uptime.stdout }}"

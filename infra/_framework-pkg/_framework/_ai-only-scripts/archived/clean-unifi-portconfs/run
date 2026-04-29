@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Detect and delete duplicate UniFi portconfs (port profiles).
+#
+# After Terraform create/destroy cycles, stale portconf entries with the same
+# display name as the current managed profiles accumulate in UniFi.  This
+# script finds and removes them.
+#
+# Usage:
+#   ./run                          — dry-run: report duplicates, no changes
+#   ./run --fix                    — apply: delete duplicate portconfs via API
+#   ./run --also-orphans           — dry-run: report duplicates AND orphans
+#   ./run --fix --also-orphans     — apply: delete both
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "$GIT_ROOT/set_env.sh"
+# shellcheck source=/dev/null
+source "$_UTILITIES_DIR/bash/init.sh"
+
+# Reuse the maas configure-server venv (Ansible already installed there).
+VENV_BASE="$_INFRA_DIR/maas-pkg/_tg_scripts/maas/configure-server"
+# shellcheck source=/dev/null
+_activate_ansible_locally "$VENV_BASE"
+
+INVENTORY="$_DYNAMIC_DIR/ansible/inventory/hosts.yml"
+if [[ ! -f "$INVENTORY" ]]; then
+  echo "Regenerating Ansible inventory..."
+  "$_GENERATE_INVENTORY" --test
+fi
+
+export ANSIBLE_HOST_KEY_CHECKING=False
+export ANSIBLE_PYTHON_INTERPRETER=auto
+
+FIX_FLAG=""
+ORPHANS_FLAG=""
+for arg in "$@"; do
+  case "$arg" in
+    --fix)          FIX_FLAG="fix=true" ;;
+    --also-orphans) ORPHANS_FLAG="also_orphans=true" ;;
+  esac
+done
+
+# Build extra-vars args (one --extra-vars per flag to avoid quoting issues)
+EXTRA_VARS_ARGS=()
+[[ -n "$FIX_FLAG" ]]     && EXTRA_VARS_ARGS+=(--extra-vars "$FIX_FLAG")
+[[ -n "$ORPHANS_FLAG" ]] && EXTRA_VARS_ARGS+=(--extra-vars "$ORPHANS_FLAG")
+
+echo "=== Clean duplicate UniFi portconfs ==="
+[[ -z "$FIX_FLAG" ]]     && echo "(dry-run — pass --fix to apply deletions)"
+[[ -n "$ORPHANS_FLAG" ]] && echo "(--also-orphans: will also delete unmanaged unused profiles)"
+echo ""
+
+ansible-playbook \
+  --inventory "$INVENTORY" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  "${EXTRA_VARS_ARGS[@]}"

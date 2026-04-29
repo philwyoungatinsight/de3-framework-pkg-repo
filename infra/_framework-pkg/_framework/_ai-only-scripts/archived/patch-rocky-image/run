@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Run the patch-rocky-image Ansible playbook.
+# Patches the existing Rocky 9 tgz in MaaS to add the grub2-install --force wrapper.
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${GIT_ROOT}/set_env.sh"
+. "${_UTILITIES_DIR}/bash/init.sh"
+
+INVENTORY="$_DYNAMIC_DIR/ansible/inventory/hosts.yml"
+if [[ ! -f "$INVENTORY" ]]; then
+  echo "Regenerating Ansible inventory..."
+  "$_GENERATE_INVENTORY" --test
+fi
+
+_activate_ansible_locally "$SCRIPT_DIR"
+
+ANSIBLE_HOST_KEY_CHECKING=False \
+ANSIBLE_PYTHON_INTERPRETER=auto \
+ANSIBLE_PIPELINING=True \
+  ansible-playbook \
+  --inventory "$INVENTORY" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  "$@"

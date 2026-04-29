@@ -1,0 +1,210 @@
+---
+# maas-power-control/playbook.yaml
+#
+# Performs MaaS power operations for a given machine. Supports:
+#   - bounce: AC power cycle via smart plug (restores AMT standby), then MaaS power-on
+#   - power-on: MaaS power-on only (no plug bounce)
+#   - power-off: MaaS power-off
+#   - status: print current MaaS status + live power state
+#
+# Environment (from run script):
+#   MAAS_HOST        - MaaS server IP (default: 10.0.10.11)
+#   SYSTEM_ID        - MaaS machine system ID (required)
+#   PLUG_HOST        - Tapo/Kasa plug IP (required for bounce action)
+#   PLUG_TYPE        - kasa or tapo (required for bounce action)
+#   ACTION           - bounce | power-on | power-off | status (required)
+#
+# Usage (via run script):
+#   ACTION=bounce SYSTEM_ID=hy8dqm PLUG_HOST=192.168.1.231 PLUG_TYPE=tapo ./run
+#   ACTION=status SYSTEM_ID=hy8dqm ./run
+#   ACTION=power-on SYSTEM_ID=hy8dqm ./run
+
+- name: "MaaS power control — gather vars"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  vars:
+    maas_host:   "{{ lookup('env', 'MAAS_HOST') | default('10.0.10.11', true) }}"
+    system_id:   "{{ lookup('env', 'SYSTEM_ID') }}"
+    plug_host:   "{{ lookup('env', 'PLUG_HOST') | default('', true) }}"
+    plug_type:   "{{ lookup('env', 'PLUG_TYPE') | default('tapo', true) }}"
+    power_action: "{{ lookup('env', 'ACTION') }}"
+  tasks:
+    - name: Validate required vars
+      ansible.builtin.assert:
+        that:
+          - system_id != ""
+          - power_action in ['bounce', 'power-on', 'power-off', 'status']
+        fail_msg: "SYSTEM_ID and ACTION (bounce|power-on|power-off|status) are required"
+
+    - name: Validate plug vars for bounce
+      ansible.builtin.assert:
+        that:
+          - plug_host != ""
+          - plug_type in ['kasa', 'tapo']
+        fail_msg: "PLUG_HOST and PLUG_TYPE (kasa|tapo) are required for bounce action"
+      when: power_action == 'bounce'
+
+- name: "MaaS power control — execute"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  vars:
+    maas_host:   "{{ lookup('env', 'MAAS_HOST') | default('10.0.10.11', true) }}"
+    system_id:   "{{ lookup('env', 'SYSTEM_ID') }}"
+    plug_host:   "{{ lookup('env', 'PLUG_HOST') | default('', true) }}"
+    plug_type:   "{{ lookup('env', 'PLUG_TYPE') | default('tapo', true) }}"
+    power_action: "{{ lookup('env', 'ACTION') }}"
+    ssh_opts:    "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"
+    maas_cmd:    "sudo /usr/bin/snap run maas maas-admin"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # STATUS — always print at the start
+    # -------------------------------------------------------------------------
+    - name: Read MaaS machine status
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "{{ maas_cmd }} machine read {{ system_id }} 2>/dev/null \
+           | python3 -c '
+        import sys, json
+        d = json.load(sys.stdin)
+        print(\"status:     \", d.get(\"status_name\", \"?\"))
+        print(\"power_type: \", d.get(\"power_type\", \"?\"))
+        print(\"power_state:\", d.get(\"power_state\", \"? (cached)\"))
+        '"
+      register: machine_status
+      ignore_errors: true
+
+    - name: Print machine status
+      ansible.builtin.debug:
+        msg: "{{ machine_status.stdout_lines }}"
+
+    - name: Query live power state
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "timeout 90 {{ maas_cmd }} machine query-power-state {{ system_id }} 2>/dev/null \
+           | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"state\",\"unknown\"))'"
+      register: live_power
+      ignore_errors: true
+
+    - name: Print live power state
+      ansible.builtin.debug:
+        msg: "Live power state: {{ live_power.stdout | default('unknown (query failed)') }}"
+
+    - name: Exit after status (status action only)
+      ansible.builtin.meta: end_play
+      when: power_action == 'status'
+
+    # -------------------------------------------------------------------------
+    # BOUNCE — plug off → wait → on → wait for AMT → MaaS power-on
+    # -------------------------------------------------------------------------
+    - name: "[bounce] Plug OFF via smart-plug-proxy"
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "curl -sf -X POST 'http://localhost:7050/power/off?host={{ plug_host }}&type={{ plug_type }}' \
+           && echo 'Plug OFF OK' || echo 'Plug OFF FAILED'"
+      register: plug_off
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Print plug-off result"
+      ansible.builtin.debug:
+        msg: "{{ plug_off.stdout_lines }}"
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Wait 8s for plug to fully cut power"
+      ansible.builtin.pause:
+        seconds: 8
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Plug ON via smart-plug-proxy"
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "curl -sf -X POST 'http://localhost:7050/power/on?host={{ plug_host }}&type={{ plug_type }}' \
+           && echo 'Plug ON OK' || echo 'Plug ON FAILED'"
+      register: plug_on
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Print plug-on result"
+      ansible.builtin.debug:
+        msg: "{{ plug_on.stdout_lines }}"
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Wait 20s for AMT to initialize after AC restore"
+      ansible.builtin.pause:
+        seconds: 20
+      when: power_action == 'bounce'
+
+    - name: "[bounce] Poll until AMT responds (up to 120s)"
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "timeout 5 bash -c 'echo | openssl s_client -connect 10.0.11.10:16993 -verify_quiet 2>&1 | head -3'"
+      register: amt_check
+      retries: 12
+      delay: 10
+      until: amt_check.rc == 0
+      ignore_errors: true
+      when: power_action == 'bounce'
+
+    - name: "[bounce] AMT reachability result"
+      ansible.builtin.debug:
+        msg: >
+          AMT {{ 'reachable' if amt_check.rc == 0 else 'still unreachable after 120s — proceeding anyway' }}
+      when: power_action == 'bounce'
+
+    # -------------------------------------------------------------------------
+    # POWER-ON (also runs after bounce)
+    # -------------------------------------------------------------------------
+    - name: "[power-on/bounce] Send MaaS power-on"
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "{{ maas_cmd }} machine power-on {{ system_id }} 2>&1 || true"
+      register: power_on_result
+      when: power_action in ['bounce', 'power-on']
+
+    - name: "[power-on/bounce] Print power-on result"
+      ansible.builtin.debug:
+        msg: "{{ power_on_result.stdout_lines }}"
+      when: power_action in ['bounce', 'power-on']
+
+    # -------------------------------------------------------------------------
+    # POWER-OFF
+    # -------------------------------------------------------------------------
+    - name: "[power-off] Send MaaS power-off"
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "{{ maas_cmd }} machine power-off {{ system_id }} 2>&1 || true"
+      register: power_off_result
+      when: power_action == 'power-off'
+
+    - name: "[power-off] Print power-off result"
+      ansible.builtin.debug:
+        msg: "{{ power_off_result.stdout_lines }}"
+      when: power_action == 'power-off'
+
+    # -------------------------------------------------------------------------
+    # Final status check
+    # -------------------------------------------------------------------------
+    - name: Wait 5s then re-read MaaS status
+      ansible.builtin.pause:
+        seconds: 5
+      when: power_action != 'status'
+
+    - name: Final MaaS machine status
+      ansible.builtin.shell: |
+        ssh {{ ssh_opts }} ubuntu@{{ maas_host }} \
+          "{{ maas_cmd }} machine read {{ system_id }} 2>/dev/null \
+           | python3 -c '
+        import sys, json
+        d = json.load(sys.stdin)
+        print(\"status:     \", d.get(\"status_name\", \"?\"))
+        print(\"power_state:\", d.get(\"power_state\", \"? (cached)\"))
+        '"
+      register: final_status
+      ignore_errors: true
+      when: power_action != 'status'
+
+    - name: Print final status
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+      when: power_action != 'status'

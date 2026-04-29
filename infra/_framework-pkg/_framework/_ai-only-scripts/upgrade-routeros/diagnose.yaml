@@ -1,0 +1,67 @@
+---
+# diagnose — checks internet access from the switch and what update channels offer.
+# Run this before the main upgrade to verify prerequisites.
+#
+# Usage: run from the upgrade-routeros directory with the venv active and env vars set.
+
+- name: Phase 1 — setup
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.add_host:
+        name: ros_switch
+        groups: [ros_switches]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 30
+
+- name: Phase 2 — diagnostics
+  hosts: ros_switches
+  gather_facts: false
+  tasks:
+    - name: Show current version and uptime
+      community.routeros.command:
+        commands: [/system resource print]
+      register: res
+    - ansible.builtin.debug:
+        msg: "{{ res.stdout[0] }}"
+
+    - name: Show routing table
+      community.routeros.command:
+        commands: [/ip route print]
+      register: routes
+    - ansible.builtin.debug:
+        msg: "{{ routes.stdout[0] }}"
+
+    - name: Set DNS to 8.8.8.8 (needed for upgrade server resolution)
+      community.routeros.command:
+        commands: ["/ip dns set servers=8.8.8.8"]
+
+    - name: Test internet (ping 8.8.8.8 from switch)
+      community.routeros.command:
+        commands: ["/ping address=8.8.8.8 count=3 interval=0.5"]
+      register: ping_res
+      ignore_errors: true
+    - ansible.builtin.debug:
+        msg: "{{ ping_res.stdout[0] | default('(failed)') }}"
+
+    - name: Check for updates on stable channel
+      community.routeros.command:
+        commands:
+          - /system package update set channel=stable
+          - /system package update check-for-updates
+      register: update_check
+      ignore_errors: true
+    - ansible.builtin.debug:
+        msg: "{{ update_check.stdout }}"
+
+    - name: Show installed packages
+      community.routeros.command:
+        commands: [/system package print]
+      register: pkgs
+    - ansible.builtin.debug:
+        msg: "{{ pkgs.stdout[0] }}"

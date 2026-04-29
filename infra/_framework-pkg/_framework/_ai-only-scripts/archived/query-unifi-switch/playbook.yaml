@@ -1,0 +1,105 @@
+---
+# Query live UniFi switch port data: link speed and MAC address table per port.
+# Useful for verifying which physical NICs are connected to which switch ports.
+#
+# Output: for each switch device, prints active and inactive ports with their
+# link speed and any client MACs seen on the port (from the MAC address table).
+#
+# Usage: ./run [SWITCH_FILTER]
+#   SWITCH_FILTER (optional env var): substring match on switch name, e.g. "Flex" or "Pro"
+#   Default: prints all switches.
+#
+# Reads UniFi credentials from config_base (SOPS-decrypted).
+
+- name: Query UniFi switch port data
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Extract UniFi credentials and API URL
+      ansible.builtin.set_fact:
+        _unifi_api_url: >-
+          {{ _all_config_params.get(
+               (_all_config_params.keys() | select('search', 'unifi/pwy-homelab$') | list | first),
+               {}
+             ).get('_provider_unifi_api_url', 'https://192.168.2.1') }}
+        _unifi_user: >-
+          {{ _all_secret_params.get(
+               (_all_secret_params.keys() | select('search', 'unifi/pwy-homelab$') | list | first),
+               {}
+             ).get('_provider_unifi_username', '') }}
+        _unifi_pass: >-
+          {{ _all_secret_params.get(
+               (_all_secret_params.keys() | select('search', 'unifi/pwy-homelab$') | list | first),
+               {}
+             ).get('_provider_unifi_password', '') }}
+
+    - name: Query UniFi switch port data
+      no_log: true
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import urllib.request, urllib.error, json, ssl, http.cookiejar, os
+
+        API      = "{{ _unifi_api_url }}"
+        USER     = "{{ _unifi_user }}"
+        PASS     = "{{ _unifi_pass }}"
+        FILTER   = os.environ.get("SWITCH_FILTER", "")
+
+        # Set up cookie jar and SSL context (self-signed cert on UDM)
+        jar = http.cookiejar.CookieJar()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(jar),
+        )
+
+        # Login
+        login_data = json.dumps({"username": USER, "password": PASS}).encode()
+        req = urllib.request.Request(
+            f"{API}/api/auth/login",
+            data=login_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = opener.open(req)
+        csrf = resp.headers.get("x-updated-csrf-token", "")
+
+        # Fetch device stats
+        req2 = urllib.request.Request(
+            f"{API}/proxy/network/api/s/default/stat/device",
+            headers={"x-csrf-token": csrf},
+        )
+        data = json.loads(opener.open(req2).read())
+
+        for dev in data.get("data", []):
+            name  = dev.get("name", "unknown")
+            mac   = dev.get("mac", "")
+            model = dev.get("model", "")
+            if FILTER and FILTER.lower() not in name.lower():
+                continue
+            print(f"\n=== {name} ({mac}, {model}) ===")
+            for p in dev.get("port_table", []):
+                pno    = p.get("port_idx", "?")
+                pname  = p.get("name", "")
+                speed  = p.get("speed", 0)
+                macs   = [m.get("mac", "") for m in p.get("mac_table", [])]
+                status = f"{speed}M" if speed else "DOWN"
+                label  = f"Port {pno:>2} ({pname:<22}): {status:<8}"
+                if macs:
+                    label += f"  clients={macs}"
+                print(label)
+        PYEOF
+      register: _result
+      environment:
+        SWITCH_FILTER: "{{ lookup('env', 'SWITCH_FILTER') }}"
+
+    - name: Print switch port data
+      ansible.builtin.debug:
+        msg: "{{ _result.stdout }}"

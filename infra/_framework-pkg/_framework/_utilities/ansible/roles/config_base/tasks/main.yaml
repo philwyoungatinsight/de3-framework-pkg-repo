@@ -1,0 +1,192 @@
+---
+# Load all pre-merged, pre-decrypted config from $_CONFIG_DIR.
+# config-mgr generate (run by set_env.sh) writes plain YAML (no SOPS) to
+# $_CONFIG_DIR. Secrets are in *.secrets.yaml files (already decrypted).
+
+- name: Verify _CONFIG_DIR is set
+  ansible.builtin.fail:
+    msg: "_CONFIG_DIR is not set. Source set_env.sh before running this role."
+  when: lookup('env', '_CONFIG_DIR') | length == 0
+
+- name: Find all config YAML files in $_CONFIG_DIR
+  ansible.builtin.shell: |
+    find "{{ lookup('env', '_CONFIG_DIR') }}" -maxdepth 1 -name '*.yaml' 2>/dev/null | sort
+  register: _found_yaml_raw
+  changed_when: false
+
+- name: Create a list of absolute paths to config YAML files (excluding secrets)
+  set_fact:
+    yaml_files: "{{ _found_yaml_raw.stdout_lines | reject('search', '\\.secrets\\.yaml$') | list }}"
+
+- name: Create a list of absolute paths to secrets YAML files
+  set_fact:
+    secrets_yaml_files: "{{ _found_yaml_raw.stdout_lines | select('search', '\\.secrets\\.yaml$') | list }}"
+
+- name: Load vars from config YAML files (plain YAML, no SOPS)
+  include_vars:
+    file: "{{ item }}"
+  loop: "{{ yaml_files }}"
+
+- name: Load vars from secrets YAML files (plain YAML, pre-decrypted by config-mgr)
+  include_vars:
+    file: "{{ item }}"
+  loop: "{{ secrets_yaml_files }}"
+
+# Collect vars: sections from all public packages into _pkg_vars so that
+# ${varname} (local) and ${pkg-name.varname} (qualified) references can be
+# resolved inline when building _all_config_params below.
+#
+# _pkg_vars shape: { '<pkg-name>': { '<varname>': '<value>', ... }, ... }
+#
+# Note: vars: keys are stored as plain dict keys — hyphens are allowed.
+# Uses q('varnames',...) + lookup('vars', k) to avoid the deprecated internal
+# "vars" dictionary (which triggered DEPRECATION WARNING in older tasks).
+- name: Collect package vars for interpolation
+  ansible.builtin.set_fact:
+    _pkg_vars: >-
+      {%- set ns = namespace(r={}) -%}
+      {%- for k in q('varnames', '.*-pkg$') | list -%}
+        {%- set v = lookup('vars', k) -%}
+        {%- if v is mapping and v.vars is defined and v.vars is mapping -%}
+          {%- set ns.r = ns.r | combine({k: v.vars}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.r }}
+
+# ---------------------------------------------------------------------------
+# Aggregate all public config_params from all packages into a single flat dict.
+# Keys are unit paths (e.g. "pwy-home-lab-pkg/_stack/proxmox/pwy-homelab/...").
+# Deeper keys override shallower ones when packages share a path (last writer wins
+# at the flat level; within a unit, ancestor-merge is done per-lookup via
+# the ancestor_merge filter plugin).
+#
+# ${varname} / ${pkg-name.varname} tokens are resolved via JSON round-trip.
+# ---------------------------------------------------------------------------
+- name: Aggregate all public config_params across all packages (flat, provider-agnostic)
+  ansible.builtin.set_fact:
+    _all_config_params: >-
+      {%- set ns = namespace(r={}) -%}
+      {%- for k in q('varnames', '.*-pkg$') | list -%}
+        {%- set v = lookup('vars', k) -%}
+        {%- if v is mapping and v.config_params is defined and v.config_params is mapping -%}
+          {%- set local_vars = _pkg_vars.get(k, {}) -%}
+          {%- set ns2 = namespace(s=v.config_params | to_json) -%}
+          {%- for vname, vval in local_vars.items() -%}
+            {%- set ns2.s = ns2.s | replace('${' + vname + '}', vval | string) -%}
+          {%- endfor -%}
+          {%- for pkg, pvars in _pkg_vars.items() -%}
+            {%- for vname, vval in pvars.items() -%}
+              {%- set ns2.s = ns2.s | replace('${' + pkg + '.' + vname + '}', vval | string) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- set resolved = ns2.s | from_json -%}
+          {%- set ns.r = ns.r | combine(resolved) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.r }}
+
+# ---------------------------------------------------------------------------
+# Aggregate all secret config_params from all packages into a single flat dict.
+# Supports two formats:
+#   NEW (preferred): top-level config_params in the secrets file
+#   OLD (backward compat): providers.<prov>.config_params (nested)
+# Both formats are merged — top-level wins over nested on key collision.
+# ---------------------------------------------------------------------------
+- name: Aggregate all secret config_params across all packages (flat)
+  ansible.builtin.set_fact:
+    _all_secret_params: >-
+      {%- set ns = namespace(r={}) -%}
+      {%- for k in q('varnames', '.*-pkg_secrets$') | list -%}
+        {%- set v = lookup('vars', k) -%}
+        {%- if v is mapping -%}
+          {# OLD style (backward compat): providers.<prov>.config_params #}
+          {%- if v.providers is defined and v.providers is mapping -%}
+            {%- for prov, pdata in v.providers.items() -%}
+              {%- if pdata is mapping and pdata.config_params is defined
+                  and pdata.config_params is mapping -%}
+                {%- set ns.r = ns.r | combine(pdata.config_params) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {# NEW style (preferred): top-level config_params — wins over OLD on collision #}
+          {%- if v.config_params is defined and v.config_params is mapping -%}
+            {%- set ns.r = ns.r | combine(v.config_params) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.r }}
+
+# ---------------------------------------------------------------------------
+# Build _tg_providers from _all_config_params, split by provider.
+# Provider is determined per-path via ancestor-merge: the _provider key set at
+# a subtree root is inherited by all descendants (same algorithm as root.hcl).
+#
+# Result shape: { '<provider>': { 'config_params': { '<path>': <params> } } }
+#
+# Usage in scripts:
+#   _tg_providers.maas.config_params          (all maas paths)
+#   _tg_providers.proxmox.config_params       (all proxmox paths)
+#   _tg_providers['null'].config_params       (all null paths)
+# ---------------------------------------------------------------------------
+- name: Build _tg_providers from _all_config_params (split by _provider via ancestor-merge)
+  ansible.builtin.set_fact:
+    _tg_providers: >-
+      {%- set ns = namespace(r={}) -%}
+      {%- for path, params in _all_config_params.items() -%}
+        {%- if params is mapping -%}
+          {# Find _provider for this path via ancestor-merge #}
+          {%- set parts = path.split('/') -%}
+          {%- set pns = namespace(provider=None) -%}
+          {%- for i in range(1, parts | length + 1) -%}
+            {%- set prefix = parts[:i] | join('/') -%}
+            {%- if prefix in _all_config_params
+                and _all_config_params[prefix] is mapping
+                and '_provider' in _all_config_params[prefix] -%}
+              {%- set pns.provider = _all_config_params[prefix]['_provider'] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if pns.provider is not none -%}
+            {%- set existing_cp = ns.r.get(pns.provider, {}).get('config_params', {}) -%}
+            {%- set ns.r = ns.r | combine(
+                {pns.provider: {'config_params': existing_cp | combine({path: params})}}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.r }}
+
+# ---------------------------------------------------------------------------
+# Build _tg_providers_secrets from _all_secret_params, split by provider.
+# Provider is determined by looking up the path in the PUBLIC _all_config_params
+# (secrets paths mirror public paths; provider is declared in public config only).
+#
+# Result shape: { '<provider>': { 'config_params': { '<path>': <params> } } }
+#
+# Usage in scripts:
+#   _tg_providers_secrets.maas.config_params[path]     (per-path maas secrets)
+#   _tg_providers_secrets.proxmox.config_params[path]  (per-path proxmox secrets)
+# ---------------------------------------------------------------------------
+- name: Build _tg_providers_secrets from _all_secret_params (split by provider)
+  ansible.builtin.set_fact:
+    _tg_providers_secrets: >-
+      {%- set ns = namespace(r={}) -%}
+      {%- for path, params in _all_secret_params.items() -%}
+        {%- if params is mapping -%}
+          {# Determine provider from PUBLIC config_params via ancestor-merge #}
+          {%- set parts = path.split('/') -%}
+          {%- set pns = namespace(provider=None) -%}
+          {%- for i in range(1, parts | length + 1) -%}
+            {%- set prefix = parts[:i] | join('/') -%}
+            {%- if prefix in _all_config_params
+                and _all_config_params[prefix] is mapping
+                and '_provider' in _all_config_params[prefix] -%}
+              {%- set pns.provider = _all_config_params[prefix]['_provider'] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if pns.provider is not none -%}
+            {%- set existing_cp = ns.r.get(pns.provider, {}).get('config_params', {}) -%}
+            {%- set ns.r = ns.r | combine(
+                {pns.provider: {'config_params': existing_cp | combine({path: params})}}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.r }}

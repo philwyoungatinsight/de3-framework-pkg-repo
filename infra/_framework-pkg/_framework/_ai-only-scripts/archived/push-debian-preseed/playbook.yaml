@@ -1,0 +1,35 @@
+---
+# Push the updated curtin preseed for Debian trixie to the MaaS server.
+# Re-runs only the preseed deployment step without re-importing the full image.
+# Use after modifying curtin_userdata_trixie.j2.
+
+- name: Load framework config
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Capture MaaS config facts
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-server/tasks/capture-config-fact.yaml"
+
+- name: Deploy updated Debian trixie preseed to MaaS server
+  hosts: maas_region
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Set MaaS config from hostvars
+      ansible.builtin.set_fact:
+        _maas_config: "{{ hostvars['localhost']['maas_config'] }}"
+
+    - name: Deploy curtin preseed (deploy-debian-preseeds.yaml)
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-server/tasks/deploy-debian-preseeds.yaml"
+      when: _maas_config.debian_images | default([]) | length > 0
+
+    - name: Skip if no debian images configured
+      ansible.builtin.debug:
+        msg: "No debian_images configured — preseed deploy skipped"
+      when: _maas_config.debian_images | default([]) | length == 0

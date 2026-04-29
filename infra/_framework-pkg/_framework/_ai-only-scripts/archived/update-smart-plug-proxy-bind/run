@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# update-smart-plug-proxy-bind/run
+#
+# One-time immediate fix: update smart-plug-proxy on the MaaS server to listen
+# on 0.0.0.0 instead of 127.0.0.1, so the MaaS rack controller can reach it
+# via the server's real IP (10.0.10.11:7050).
+#
+# Root cause: webhook URLs used localhost → MaaS extracted 127.0.0.1 as BMC IP
+# → not on any managed subnet → no rack controller found → "Error determining
+# BMC task queue" on every commission attempt.
+#
+# The Terraform code fix (maas_host IP in _proxy) handles the webhook URL update
+# automatically on the next wave re-run. This script handles only the proxy
+# bind address change, which requires immediate deployment to unblock nuc-1.
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "${GIT_ROOT}/set_env.sh"
+
+MAAS_HOST="10.0.10.11"
+SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+PROXY_SCRIPT="${GIT_ROOT}/infra/maas-pkg/_tg_scripts/maas/configure-server/smart-plug-proxy/smart-plug-proxy.py"
+
+echo "=== Step 1: Upload updated smart-plug-proxy.py to MaaS server ==="
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  "${PROXY_SCRIPT}" ubuntu@"${MAAS_HOST}":/tmp/smart-plug-proxy-new.py
+
+echo "=== Step 2: Install updated script and restart service ==="
+${SSH} ubuntu@"${MAAS_HOST}" bash -s << 'REMOTE_EOF'
+sudo install -m 0755 -o root -g root \
+  /tmp/smart-plug-proxy-new.py \
+  /opt/smart-plug-proxy/smart-plug-proxy.py
+rm -f /tmp/smart-plug-proxy-new.py
+sudo systemctl restart smart-plug-proxy
+sleep 2
+sudo systemctl status smart-plug-proxy --no-pager | head -5
+REMOTE_EOF
+
+echo "=== Step 3: Verify proxy is reachable at ${MAAS_HOST}:7050 ==="
+${SSH} ubuntu@"${MAAS_HOST}" \
+  "curl -sf http://${MAAS_HOST}:7050/health && echo 'Proxy reachable at ${MAAS_HOST}:7050 — bind fix confirmed'"
+
+echo "=== Done: proxy now binds to 0.0.0.0:7050 ==="
+echo "Next: re-run the MaaS build. TF will update nuc-1 webhook URLs to use ${MAAS_HOST}:7050."

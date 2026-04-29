@@ -1,0 +1,2 @@
+---
+common_infra_dir: "{{ lookup('env', '_INFRA_DIR') }}"

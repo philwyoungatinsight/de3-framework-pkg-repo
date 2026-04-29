@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Push the updated Debian trixie curtin preseed to the MaaS server.
+# Run after modifying curtin_userdata_trixie.j2.
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$GIT_ROOT/set_env.sh"
+
+VENV_BASE="$SCRIPT_DIR"
+_activate_ansible_locally "$VENV_BASE"
+
+INVENTORY="$_DYNAMIC_DIR/ansible/inventory/hosts.yml"
+
+if [[ ! -f "$INVENTORY" ]]; then
+  echo "Regenerating Ansible inventory..."
+  "$_GENERATE_INVENTORY" --test
+fi
+
+export ANSIBLE_HOST_KEY_CHECKING=False
+export ANSIBLE_PYTHON_INTERPRETER=auto
+# _ANSIBLE_ROLES_DIR is set by set_env.sh — do not override
+
+echo "=== Pushing updated Debian trixie preseed to MaaS server ==="
+ansible-playbook \
+  --inventory "$INVENTORY" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  "$@"

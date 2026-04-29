@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# upgrade-routeros — upgrades MikroTik CRS317 from RouterOS 6.x to the latest
+# stable RouterOS 7.x release.
+#
+# Two-phase upgrade (RouterOS 6 package manager does not offer cross-major upgrades):
+#   Phase 1: playbook.yaml — upgrades 6.49.8 → 6.49.19 (latest 6.x) via package manager
+#   Phase 2: upgrade-to-7.yaml — downloads routeros-7.x.y-arm.npk directly from
+#             download.mikrotik.com and reboots; RouterOS installs it on boot
+#
+# If the switch is already on 6.49.19, Phase 1 is skipped automatically.
+# If the switch is already on 7.x, both phases are skipped.
+#
+# Usage:
+#   ./run                                     # full upgrade (6.49.8 → 6.49.19 → 7.x)
+#   ROUTEROS_7_VERSION=7.18.1 ./run           # pin a specific 7.x version
+#   _ROUTEROS_REBOOT_WAIT_TIMEOUT=600 ./run   # increase reboot wait
+#
+# Prerequisites:
+#   - Laptop connected to switch ether1 (dev at 192.168.88.10, switch at 192.168.88.1)
+#   - Management gateway 10.0.11.1 (UDM) reachable from switch's VLAN 11 interface
+#
+# After the upgrade succeeds:
+#   - Update mikrotik-pkg.yaml endpoint to apis://192.168.88.1:8729
+#   - Re-add routeros_ip_route resource to infra/mikrotik-pkg/_modules/routeros_switch/main.tf
+#   - Run the network.mikrotik wave to verify
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=/dev/null
+source "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+_activate_ansible_locally "$SCRIPT_DIR"
+
+# network_cli connection requires paramiko (ansible-pylibssh is preferred but not installed)
+pip install --quiet paramiko
+
+# Paramiko does NOT honour ansible_ssh_common_args for host key checking
+export ANSIBLE_HOST_KEY_CHECKING=false
+
+# Read credentials from SOPS (sops --extract opens editor in 3.10.2; use decrypt + parse)
+SOPS_FILE="$_INFRA_DIR/mikrotik-pkg/_config/mikrotik-pkg_secrets.sops.yaml"
+_DECRYPTED="$(sops --decrypt --output-type yaml "$SOPS_FILE")"
+export ROUTEROS_USER
+export ROUTEROS_PASS
+ROUTEROS_USER="$(echo "$_DECRYPTED" | python3 -c "import sys,yaml; d=yaml.safe_load(sys.stdin); print(d['mikrotik-pkg_secrets']['config_params']['mikrotik-pkg/_stack/routeros/pwy-homelab']['_provider_routeros_username'])")"
+ROUTEROS_PASS="$(echo "$_DECRYPTED" | python3 -c "import sys,yaml; d=yaml.safe_load(sys.stdin); print(d['mikrotik-pkg_secrets']['config_params']['mikrotik-pkg/_stack/routeros/pwy-homelab']['_provider_routeros_password'])")"
+unset _DECRYPTED
+
+# Config (override via env)
+export ROUTEROS_HOST="${ROUTEROS_HOST:-192.168.88.1}"
+export ROUTEROS_MGMT_GATEWAY="${ROUTEROS_MGMT_GATEWAY:-10.0.11.1}"
+export ROUTEROS_7_VERSION="${ROUTEROS_7_VERSION:-}"      # e.g. "7.18.1"; empty = use STABLE redirect
+export _ROUTEROS_REBOOT_WAIT_TIMEOUT="${_ROUTEROS_REBOOT_WAIT_TIMEOUT:-420}"
+
+echo "=== RouterOS upgrade script ==="
+echo "  Host:    $ROUTEROS_HOST"
+echo "  Gateway: $ROUTEROS_MGMT_GATEWAY"
+echo "  ROS 7 version override: ${ROUTEROS_7_VERSION:-'(STABLE redirect)'}"
+echo "  Reboot wait timeout: ${_ROUTEROS_REBOOT_WAIT_TIMEOUT}s"
+echo ""
+
+# Phase 1: upgrade to latest 6.49.x (idempotent if already on 6.49.19)
+echo "--- Phase 1: upgrade to latest 6.49.x ---"
+ansible-playbook \
+  -i "$GIT_ROOT/infra/_framework-pkg/_generate-inventory/inventory/localhost.yaml" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  -v || true   # playbook may fail on reboot wait if switch takes > timeout; we continue
+
+# Brief pause before Phase 2 to ensure switch is reachable
+echo ""
+echo "--- Waiting 10s before Phase 2 ---"
+sleep 10
+
+# Phase 2: download routeros 7.x and install
+echo "--- Phase 2: upgrade to RouterOS 7.x ---"
+ansible-playbook \
+  -i "$GIT_ROOT/infra/_framework-pkg/_generate-inventory/inventory/localhost.yaml" \
+  "$SCRIPT_DIR/upgrade-to-7.yaml" \
+  -v

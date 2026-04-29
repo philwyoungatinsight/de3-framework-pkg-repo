@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""
+clean-all/run
+
+Nuclear cleanup: destroy all Terraform resources, remove all backend state
+and locks, and wipe all local Terragrunt cache.
+
+Use this when "make clean" or a standard wave clean-up is stuck or
+partially failed, or when you want a fully clean slate.
+
+Stages (all run even if earlier stages fail):
+  0.   Per-package pre-purge scripts (infra/<pkg>/_clean_all/run) in
+       pre_destroy_order from framework.yaml.  Each script receives
+       all_config_params and all_secret_params as JSON env vars so SOPS is
+       only decrypted once.
+  1.   Remove all backend state locks (unblocks stuck destroy)
+  2.   Terragrunt destroy, wave-by-wave in reverse order
+  3.   Force-wipe backend state for destroyed waves (full bucket delete when
+       no waves were skipped; state left intact for skipped waves)
+  4.   Wipe local .terragrunt-cache dirs and .terraform.lock.hcl files
+
+Configuration (in config/framework.yaml):
+  clean_all:
+    pre_destroy_order:      # packages with infra/<pkg>/_clean_all/run to call before destroy
+      - proxmox-pkg
+      - gcp-pkg
+      - unifi-pkg
+Usage:
+  ./run               # asks you to type "NUKE" to confirm
+  ./run --force       # skip confirmation (for CI / scripted use)
+
+Timeout:
+  Stage 2 has a 30-minute default timeout.
+  Override: NUKE_DESTROY_TIMEOUT=600 ./run --force
+"""
+
+import fnmatch
+import json
+import os
+import shutil
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+
+# Add _utilities/python to path so framework_config is importable
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "_utilities" / "python"))
+from framework_config import find_framework_config_dirs, load_framework_config
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+def _git_root():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("ERROR: not in a git repository")
+    return Path(r.stdout.strip())
+
+
+GIT_ROOT = _git_root()
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _find_infra_dir():
+    infra_dir = os.environ.get("_INFRA_DIR")
+    if infra_dir:
+        return Path(infra_dir)
+    return GIT_ROOT / "infra"
+
+
+def _ancestor_get(all_params, path, key):
+    """Return the nearest ancestor value for key, walking up path components."""
+    parts = path.split("/")
+    result = None
+    for i in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:i])
+        entry = all_params.get(prefix)
+        if isinstance(entry, dict) and key in entry:
+            result = entry[key]
+    return result
+
+
+def _load_merged_config():
+    """Load framework config + all infra/*/_config/<pkg>.yaml files.
+
+    Returns a merged dict with:
+      backend           — from framework.yaml
+      clean_all         — from framework.yaml
+      waves             — assembled from waves_ordering + package wave defs
+      _all_config_params — flat dict of all public config_params, keyed by path
+    """
+    infra_dir = _find_infra_dir()
+    merged: dict = {}
+    all_wave_defs: dict = {}
+    all_config_params: dict = {}
+
+    # Load framework config from split framework_*.yaml files (framework dir + config/ overrides).
+    fw_cfg = load_framework_config(find_framework_config_dirs(GIT_ROOT))
+    for key, v in fw_cfg.items():
+        if key not in ("waves", "providers", "config_params"):
+            merged[key] = v
+
+    # Load all package configs — collect config_params and wave definitions
+    for pkg_config in sorted(
+        pkg_dir / "_config" / f"{pkg_dir.name}.yaml"
+        for pkg_dir in infra_dir.iterdir()
+        if pkg_dir.is_dir() and (pkg_dir / "_config" / f"{pkg_dir.name}.yaml").exists()
+    ):
+        with open(pkg_config) as f:
+            raw = yaml.safe_load(f) or {}
+        for pkg_name, pkg_cfg in raw.items():
+            if not isinstance(pkg_cfg, dict):
+                continue
+            # Collect wave definitions
+            for wave in pkg_cfg.get("waves", []) or []:
+                wname = wave.get("name")
+                if wname:
+                    all_wave_defs[wname] = wave
+            # Collect config_params (flat — keyed by unit path)
+            for path, params in (pkg_cfg.get("config_params") or {}).items():
+                if isinstance(params, dict):
+                    all_config_params[path] = params
+
+    # Load waves_ordering.yaml
+    ordering_file = GIT_ROOT / "config" / "waves_ordering.yaml"
+    if not ordering_file.exists():
+        ordering_file = next(
+            (pkg_dir / "_config" / "waves_ordering.yaml"
+             for pkg_dir in sorted(infra_dir.iterdir())
+             if pkg_dir.is_dir() and (pkg_dir / "_config" / "waves_ordering.yaml").exists()),
+            None,
+        )
+    waves_ordering = []
+    if ordering_file and ordering_file.exists():
+        with open(ordering_file) as f:
+            ordering_raw = yaml.safe_load(f) or {}
+        waves_ordering = [
+            (e["name"] if isinstance(e, dict) else e)
+            for e in (ordering_raw.get("waves_ordering") or [])
+        ]
+
+    merged["waves"] = [
+        {k: v for k, v in all_wave_defs[wn].items()}
+        for wn in waves_ordering
+        if wn in all_wave_defs
+    ]
+    merged["_all_config_params"] = all_config_params
+    return merged
+
+
+def _load_all_secret_params():
+    """Decrypt all infra/*/_config/*.sops.yaml files and return a flat
+    dict of all secret config_params, keyed by unit path.
+
+    Supports both the new format (top-level config_params) and the old
+    format (providers.<prov>.config_params) for backward compat.
+    """
+    infra_dir = _find_infra_dir()
+    all_secret_params: dict = {}
+
+    for pkg_dir in sorted(infra_dir.iterdir()):
+        if not pkg_dir.is_dir():
+            continue
+        config_dir = pkg_dir / "_config"
+        if not config_dir.is_dir():
+            continue
+        for sops_file in config_dir.glob("*.sops.yaml"):
+            r = subprocess.run(
+                ["sops", "--decrypt", str(sops_file)],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                continue
+            raw = yaml.safe_load(r.stdout) or {}
+            for top_key, top_val in raw.items():
+                if not isinstance(top_val, dict):
+                    continue
+                # New format: top-level config_params
+                for path, params in (top_val.get("config_params") or {}).items():
+                    if isinstance(params, dict):
+                        all_secret_params.setdefault(path, {}).update(params)
+                # Old format (backward compat): providers.<prov>.config_params
+                for prov, prov_data in (top_val.get("providers") or {}).items():
+                    if not isinstance(prov_data, dict):
+                        continue
+                    for path, params in (prov_data.get("config_params") or {}).items():
+                        if isinstance(params, dict):
+                            all_secret_params.setdefault(path, {}).update(params)
+
+    return all_secret_params
+
+
+def _find_stack_config():
+    """Locate framework.yaml."""
+    candidate = GIT_ROOT / "config" / "framework.yaml"
+    if candidate.exists():
+        return str(candidate)
+    infra_dir = _find_infra_dir()
+    for pkg_dir in sorted(infra_dir.iterdir()):
+        if pkg_dir.is_dir():
+            f = pkg_dir / "_config" / "framework.yaml"
+            if f.exists():
+                return str(f)
+    raise SystemExit("ERROR: could not find framework.yaml in config/ or any infra/*/_config/")
+
+
+def _read_backend(merged_cfg):
+    b = merged_cfg.get("backend", {})
+    return b.get("type", "local"), b.get("config", {}).get("bucket", "")
+
+
+def _read_delete_state_bucket(merged_cfg):
+    return merged_cfg.get("clean_all", {}).get("wipe_state_bucket_contents", True)
+
+
+def _read_pre_destroy_order(merged_cfg):
+    return merged_cfg.get("clean_all", {}).get("pre_destroy_order", [])
+
+
+def _read_all_waves(merged_cfg):
+    return [w["name"] for w in merged_cfg.get("waves", [])]
+
+
+# ---------------------------------------------------------------------------
+# Confirm destructive
+# ---------------------------------------------------------------------------
+
+def confirm_destructive(message, keyword):
+    if os.environ.get("_FORCE_DELETE", "").upper() == "YES":
+        return
+
+    print()
+    print("=" * 72)
+    print(f"WARNING: {message}")
+    print("=" * 72)
+    try:
+        with open("/dev/tty", "r") as tty:
+            sys.stdout.write(f'\nType "{keyword}" to confirm: ')
+            sys.stdout.flush()
+            answer = tty.readline().strip()
+    except OSError:
+        answer = input(f'\nType "{keyword}" to confirm: ').strip()
+
+    if answer != keyword:
+        print("Aborted.")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Stage 0: Per-package pre-purge scripts
+# ---------------------------------------------------------------------------
+
+def stage_pre_destroy_purge(merged_cfg, all_config_params, all_secret_params):
+    """Run infra/<pkg>/_clean_all/run for each package in pre_destroy_order.
+
+    Passes all_config_params and all_secret_params as JSON env vars so SOPS
+    decryption happens once here rather than once per package script.
+    Packages without a _clean_all/run are silently skipped.
+    """
+    print("--- Stage 0: per-package pre-destroy purge ---")
+
+    order = _read_pre_destroy_order(merged_cfg)
+    if not order:
+        print("  pre_destroy_order is empty — skipping.")
+        return
+
+    infra_dir   = _find_infra_dir()
+    config_json = json.dumps(all_config_params)
+    secret_json = json.dumps(all_secret_params)
+
+    for pkg in order:
+        script = infra_dir / pkg / "_clean_all" / "run"
+        if not script.is_file():
+            print(f"  WARNING: {script} not found — skipping {pkg}.")
+            continue
+        print(f"\n  --- purge: {pkg} ---")
+        try:
+            subprocess.run(
+                [str(script)],
+                env={**os.environ,
+                     "_CLEAN_ALL_CONFIG_PARAMS": config_json,
+                     "_CLEAN_ALL_SECRET_PARAMS": secret_json},
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  WARNING: {pkg} purge timed out after 300s.")
+        except Exception as exc:
+            print(f"  WARNING: {pkg} purge error: {exc}")
+
+    print("\n  Stage 0 done.")
+
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Remove state locks
+# ---------------------------------------------------------------------------
+
+def stage_unlock(backend_type, bucket):
+    print("--- Stage 1: Removing backend state locks ---")
+
+    if backend_type == "gcs" and bucket:
+        r = subprocess.run(
+            ["gsutil", "ls", "-r", f"gs://{bucket}/"],
+            capture_output=True, text=True, timeout=60,
+        )
+        lock_files = [l for l in r.stdout.splitlines() if l.endswith(".tflock")]
+
+        if not lock_files:
+            print("  No lock files found.")
+        else:
+            print(f"  Found {len(lock_files)} lock file(s) — deleting...")
+            subprocess.run(
+                ["gsutil", "-m", "rm"] + lock_files,
+                capture_output=True, timeout=60,
+            )
+            print(f"  Removed {len(lock_files)} lock file(s).")
+    else:
+        print(f"  Backend type '{backend_type}': no lock removal needed.")
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Terragrunt destroy, wave-by-wave in reverse order
+# ---------------------------------------------------------------------------
+
+def stage_destroy(merged_cfg, skip_patterns, nuke_destroy_timeout):
+    print(f"--- Stage 2: Terragrunt destroy, reverse wave order (timeout={nuke_destroy_timeout}s per wave) ---")
+
+    all_waves = _read_all_waves(merged_cfg)
+    plan = []
+    for w in reversed(all_waves):
+        tag = "SKIP" if any(fnmatch.fnmatch(w, pat) for pat in skip_patterns) else "RUN"
+        plan.append((tag, w))
+
+    run_count  = sum(1 for tag, _ in plan if tag == "RUN")
+    skip_count = sum(1 for tag, _ in plan if tag == "SKIP")
+    print(f"  Destroying {run_count} of {len(plan)} wave(s) ({skip_count} skipped).")
+
+    for tag, wave in plan:
+        if tag == "SKIP":
+            print(f"  SKIP: {wave}")
+            continue
+
+        print(f"\n  --- destroy wave: {wave} ---")
+        try:
+            subprocess.run(
+                ["terragrunt", "run", "--all", "destroy", "--non-interactive"],
+                env={**os.environ, "TG_WAVE": wave},
+                cwd=str(_find_infra_dir()),
+                timeout=nuke_destroy_timeout + 30,
+            )
+            print(f"  [{wave}] destroy complete.")
+        except subprocess.TimeoutExpired:
+            print(f"  WARNING: [{wave}] destroy timed out after {nuke_destroy_timeout}s — continuing.")
+        except Exception as exc:
+            print(f"  WARNING: [{wave}] destroy error: {exc} — continuing.")
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Force-wipe remote backend state
+# ---------------------------------------------------------------------------
+
+def stage_wipe_remote_state(backend_type, bucket, delete_bucket, merged_cfg, skip_patterns):
+    print("--- Stage 3: Force-wiping remote backend state ---")
+
+    if not delete_bucket:
+        print("  wipe_state_bucket_contents=false — bucket contents preserved.")
+        return
+
+    if backend_type == "gcs":
+        if not bucket:
+            print("  No GCS bucket configured. Skipping.")
+            return
+
+        r = subprocess.run(
+            ["gsutil", "ls", f"gs://{bucket}"],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            print(f"  Bucket gs://{bucket} does not exist (already clean).")
+            return
+
+        r2 = subprocess.run(
+            ["gsutil", "ls", "-r", f"gs://{bucket}/"],
+            capture_output=True, text=True, timeout=60,
+        )
+        all_objects = [l for l in r2.stdout.splitlines() if l and not l.endswith(":")]
+
+        if not all_objects:
+            print("  Bucket is already empty.")
+            return
+
+        # Compute GCS path prefixes to preserve (skipped waves)
+        preserve_prefixes = []
+        if skip_patterns:
+            seen = set()
+            for path, params in merged_cfg.get("_all_config_params", {}).items():
+                if not isinstance(params, dict):
+                    continue
+                wave = _ancestor_get(merged_cfg["_all_config_params"], path, "_wave")
+                if wave and any(fnmatch.fnmatch(wave, pat) for pat in skip_patterns):
+                    prefix = path + "/"
+                    if prefix not in seen:
+                        seen.add(prefix)
+                        preserve_prefixes.append(prefix)
+
+        base = f"gs://{bucket}/"
+        if preserve_prefixes:
+            to_delete = [
+                obj for obj in all_objects
+                if obj.startswith(base) and not any(
+                    obj[len(base):].startswith(p) for p in preserve_prefixes
+                )
+            ]
+            print(f"  Deleting {len(to_delete)} object(s); preserving: {', '.join(preserve_prefixes)}")
+        else:
+            to_delete = all_objects
+            print(f"  Deleting {len(to_delete)} object(s) from gs://{bucket}/ ...")
+
+        if to_delete:
+            p = subprocess.Popen(
+                ["gsutil", "-m", "rm", "-I"],
+                stdin=subprocess.PIPE, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            _, stderr = p.communicate(input="\n".join(to_delete))
+            if p.returncode != 0:
+                print(f"  WARNING: gsutil rm exited {p.returncode}:\n{stderr.strip()}")
+
+        # Retry survivors individually
+        r3 = subprocess.run(
+            ["gsutil", "ls", "-r", f"gs://{bucket}/"],
+            capture_output=True, text=True, timeout=60,
+        )
+        survivors = [l for l in r3.stdout.splitlines() if l and not l.endswith(":")]
+        if preserve_prefixes:
+            survivors = [
+                obj for obj in survivors
+                if obj.startswith(base) and not any(
+                    obj[len(base):].startswith(p) for p in preserve_prefixes
+                )
+            ]
+        if survivors:
+            print(f"  {len(survivors)} object(s) survived — retrying individually:")
+            failed = []
+            for obj in survivors:
+                r4 = subprocess.run(["gsutil", "rm", obj],
+                                    capture_output=True, text=True, timeout=30)
+                if r4.returncode == 0:
+                    print(f"    deleted: {obj}")
+                else:
+                    print(f"    FAILED:  {obj}\n    {r4.stderr.strip()}")
+                    failed.append(obj)
+            if failed:
+                print(f"  WARNING: {len(failed)} object(s) could not be deleted:")
+                for obj in failed:
+                    print(f"    {obj}")
+            else:
+                print("  All survivors deleted on retry.")
+
+        print("  Bucket contents cleared (bucket preserved for reuse on next 'make').")
+
+    elif backend_type == "local":
+        print("  Removing local tfstate files...")
+        for pattern in ("terraform.tfstate", "terraform.tfstate.backup"):
+            for p in GIT_ROOT.rglob(pattern):
+                if ".terragrunt-cache" not in str(p):
+                    p.unlink(missing_ok=True)
+        print("  Done.")
+
+    else:
+        print(f"  WARNING: Remote state wipe not implemented for backend '{backend_type}'.")
+        print("  Delete state manually from your backend.")
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Wipe local Terragrunt artefacts
+# ---------------------------------------------------------------------------
+
+def stage_wipe_local():
+    print("--- Stage 4: Wiping local Terragrunt cache ---")
+
+    cache_dirs = [
+        p for p in GIT_ROOT.rglob(".terragrunt-cache")
+        if p.is_dir() and ".terragrunt-cache" not in str(p.parent)
+    ]
+    lock_files = [
+        p for p in GIT_ROOT.rglob(".terraform.lock.hcl")
+        if ".terragrunt-cache" not in str(p)
+    ]
+
+    print(f"  Removing {len(cache_dirs)} .terragrunt-cache dir(s)...")
+    for d in cache_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+    print(f"  Removing {len(lock_files)} .terraform.lock.hcl file(s)...")
+    for f in lock_files:
+        f.unlink(missing_ok=True)
+
+    print("  Done.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run_nuke(nuke_destroy_timeout):
+    merged_cfg           = _load_merged_config()
+    backend_type, bucket = _read_backend(merged_cfg)
+    delete_bucket        = _read_delete_state_bucket(merged_cfg)
+    all_config_params    = merged_cfg["_all_config_params"]
+    skip_patterns        = []   # clean-all destroys everything — no skipping
+
+    print()
+    print("=" * 64)
+    print(" CLEAN-ALL: Full destruction of all stack resources")
+    print("=" * 64)
+    print()
+    print(f"  Stack root      : {GIT_ROOT}")
+    print(f"  Backend         : {backend_type}")
+    if bucket:
+        print(f"  Bucket          : {bucket}")
+    print(f"  Destroy timeout : {nuke_destroy_timeout}s (override: NUKE_DESTROY_TIMEOUT=N)")
+    print(f"  Delete bucket   : {delete_bucket}")
+    print()
+
+    # Load secrets once and pass to pre-purge subprocesses so SOPS is only
+    # decrypted here rather than once per package script.
+    print("  Loading secrets for pre-purge stage...")
+    try:
+        all_secret_params = _load_all_secret_params()
+    except Exception as exc:
+        print(f"  WARNING: could not load secrets: {exc} — pre-purge stage may be incomplete.")
+        all_secret_params = {}
+    print()
+
+    try:
+        stage_pre_destroy_purge(merged_cfg, all_config_params, all_secret_params)
+    except Exception as exc:
+        print(f"  WARNING: Stage 0 error: {exc}")
+    print()
+
+    try:
+        stage_unlock(backend_type, bucket)
+    except Exception as exc:
+        print(f"  WARNING: Stage 1 error: {exc}")
+    print()
+
+    try:
+        stage_destroy(merged_cfg, skip_patterns, nuke_destroy_timeout)
+    except Exception as exc:
+        print(f"  WARNING: Stage 2 error: {exc}")
+    print()
+
+    try:
+        stage_wipe_remote_state(backend_type, bucket, delete_bucket, merged_cfg, skip_patterns)
+    except Exception as exc:
+        print(f"  WARNING: Stage 3 error: {exc}")
+    print()
+
+    try:
+        stage_wipe_local()
+    except Exception as exc:
+        print(f"  WARNING: Stage 4 error: {exc}")
+    print()
+
+    print("=" * 64)
+    print(" CLEAN-ALL complete.")
+    print(" Run 'make' to rebuild from scratch.")
+    print("=" * 64)
+    print()
+
+
+def show_usage():
+    print(f"Usage: {sys.argv[0]} [--force] [--help]")
+    print("""
+  --force    Skip the "NUKE" confirmation prompt.
+  --help     Show this help.
+
+Environment overrides:
+  NUKE_DESTROY_TIMEOUT   Seconds to wait for terragrunt destroy (default: 1800).
+  _FORCE_DELETE=YES       Skip the confirmation prompt (same as --force).
+
+Stages:
+  0    Per-package pre-purge: runs infra/<pkg>/_clean_all/run in the order
+       listed under clean_all.pre_destroy_order in config/framework.yaml.
+  1    Remove all GCS state locks (unblocks stuck destroy).
+  2    Run "terragrunt run --all destroy" with TG_WAVE filtering (best-effort).
+  3    Wipe remote state bucket contents (controlled by wipe_state_bucket_contents config).
+  4    Wipe all local .terragrunt-cache dirs and .terraform.lock.hcl.
+""")
+    sys.exit(1)
+
+
+def main():
+    force = False
+    for arg in sys.argv[1:]:
+        if arg in ("--force", "-f"):
+            force = True
+        elif arg in ("--help", "-h"):
+            show_usage()
+        else:
+            print(f"Unknown argument: {arg}")
+            show_usage()
+
+    if force:
+        os.environ["_FORCE_DELETE"] = "YES"
+
+    # Source set_env.sh to get _INFRA_DIR etc. (best-effort; env may already be set)
+    set_env = GIT_ROOT / "set_env.sh"
+    if set_env.exists() and "_INFRA_DIR" not in os.environ:
+        r = subprocess.run(
+            ["bash", "-c", f"set -a; source {set_env}; set +a; env"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k, v)
+
+    try:
+        nuke_destroy_timeout = int(os.environ.get("NUKE_DESTROY_TIMEOUT", "1800"))
+    except ValueError:
+        nuke_destroy_timeout = 1800
+
+    confirm_destructive(
+        "This will DESTROY all cloud resources and wipe Terraform state. "
+        "Resources that fail to destroy will be ORPHANED. There is NO undo.",
+        "NUKE",
+    )
+
+    run_nuke(nuke_destroy_timeout)
+
+
+if __name__ == "__main__":
+    main()

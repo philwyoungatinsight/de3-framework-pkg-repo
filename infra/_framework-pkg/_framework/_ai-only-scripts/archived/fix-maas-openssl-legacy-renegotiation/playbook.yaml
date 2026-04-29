@@ -1,0 +1,86 @@
+---
+# Patch /etc/ssl/openssl.cnf on BOTH the MaaS region server AND rack controller
+# to enable UnsafeLegacyRenegotiation for Intel AMT compatibility.
+#
+# Root cause: MaaS's wsman binary uses system libssl.so.3 (OpenSSL 3.0+),
+# which disables legacy TLS renegotiation by default. Intel AMT firmware
+# requires legacy TLS renegotiation, so all wsman AMT calls fail.
+#
+# This task patches /etc/ssl/openssl.cnf on each host, which is the reliable
+# fix: all processes use this file by default (when OPENSSL_CONF env var is not
+# set). It must run on the rack controller (10.0.10.13) because that is the host
+# that spawns wsman subprocesses for AMT power operations.
+#
+# The permanent fix is in:
+#   infra/maas-pkg/_tg_scripts/maas/configure-server/tasks/fix-maas-amt-ssl.yaml
+#   infra/maas-pkg/_tg_scripts/maas/configure-rack/playbook.configure-rack.yaml
+#
+# Idempotent: checks for UnsafeLegacyRenegotiation before writing.
+
+- name: Patch OpenSSL on MaaS hosts (region + rack)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check if openssl.cnf already patched
+      ansible.builtin.command: grep -c "UnsafeLegacyRenegotiation" /etc/ssl/openssl.cnf
+      register: already_patched
+      changed_when: false
+      failed_when: false
+
+    - name: Show current patch state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: UnsafeLegacyRenegotiation already present: {{ already_patched.stdout | int > 0 }}"
+
+    - name: Patch /etc/ssl/openssl.cnf with UnsafeLegacyRenegotiation
+      when: already_patched.stdout | int == 0
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import re, sys
+
+        with open('/etc/ssl/openssl.cnf', 'r') as f:
+            content = f.read()
+
+        if 'UnsafeLegacyRenegotiation' in content:
+            sys.exit(0)
+
+        content = re.sub(
+            r'(providers = provider_sect)',
+            r'\1\nssl_conf = ssl_sect',
+            content,
+            count=1
+        )
+
+        content += (
+            '\n# BEGIN: UnsafeLegacyRenegotiation for Intel AMT (added by MaaS automation)\n'
+            '[ssl_sect]\n'
+            'system_default = system_default_sect\n\n'
+            '[system_default_sect]\n'
+            'Options = UnsafeLegacyRenegotiation\n'
+            'MinProtocol = None\n'  # Allow TLS 1.0/1.1 for older AMT firmware
+            '# END: UnsafeLegacyRenegotiation\n'
+        )
+
+        with open('/etc/ssl/openssl.cnf', 'w') as f:
+            f.write(content)
+
+        print('CHANGED')
+        PYEOF
+      register: patch_result
+      changed_when: "'CHANGED' in patch_result.stdout"
+
+    - name: Restart MaaS if patch was applied
+      ansible.builtin.command: snap restart maas
+      when: patch_result is changed
+      changed_when: true
+
+    - name: Verify patch is present
+      ansible.builtin.command: grep -c "UnsafeLegacyRenegotiation" /etc/ssl/openssl.cnf
+      register: verify_result
+      changed_when: false
+      failed_when: verify_result.stdout | int == 0
+
+    - name: Confirm patch applied
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: OpenSSL UnsafeLegacyRenegotiation enabled — wsman can now connect to Intel AMT"

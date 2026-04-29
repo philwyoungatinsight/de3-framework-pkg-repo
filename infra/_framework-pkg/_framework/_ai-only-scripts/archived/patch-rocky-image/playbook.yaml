@@ -1,0 +1,192 @@
+---
+# One-time playbook to patch the existing Rocky 9 tgz in MaaS.
+#
+# Context: the imported rocky-9 tgz is missing the grub2-install wrapper that
+# adds --force. Curtin's RHEL curthooks run `chroot /target grub2-install
+# --target=x86_64-efi ...` but Rocky 9's grub2-install refuses without --force.
+#
+# This playbook:
+#   1. Finds the rocky-9 boot resource ID in MaaS
+#   2. Extracts the existing tgz to a work directory
+#   3. Adds /usr/local/sbin/grub2-install wrapper (--force passthrough)
+#   4. Repacks the tgz
+#   5. Deletes the old boot resource
+#   6. Re-imports the patched tgz
+#   7. Triggers boot-resources import
+#
+# Avoids re-downloading the 700MB GenericCloud qcow2 — works directly with the
+# existing image stored in MaaS image-storage.
+#
+# Run: ./run (from this directory)
+# Target: MaaS server at 10.0.10.11
+
+- name: Patch Rocky 9 tgz on MaaS server
+  hosts: maas_region
+  gather_facts: false
+  become: true
+  vars:
+    _work_dir: "/var/snap/maas/common/rocky-patch"
+    _img_storage: "/var/snap/maas/common/maas/image-storage"
+    _rocky_image_file: "569a67f"
+    _rocky_resource_id: 14
+    _rocky_resource_name: "custom/rocky-9"
+    _rocky_title: "Rocky Linux 9"
+    _rocky_arch: "amd64/generic"
+
+  tasks:
+    - name: Verify rocky-9 image file exists
+      ansible.builtin.stat:
+        path: "{{ _img_storage }}/{{ _rocky_image_file }}"
+      register: _img_stat
+
+    - name: Fail if image file not found
+      ansible.builtin.fail:
+        msg: "Rocky 9 image file {{ _img_storage }}/{{ _rocky_image_file }} not found. Check the file hash."
+      when: not _img_stat.stat.exists
+
+    - name: Report image file size
+      ansible.builtin.debug:
+        msg: "Rocky 9 tgz: {{ _img_storage }}/{{ _rocky_image_file }} ({{ _img_stat.stat.size | filesizeformat }})"
+
+    - name: Create work directory
+      ansible.builtin.file:
+        path: "{{ _work_dir }}/extracted"
+        state: directory
+        mode: "0700"
+
+    - name: Extract existing rocky-9 tgz to work directory
+      ansible.builtin.shell: |
+        echo "Extracting rocky-9 tgz (this may take a few minutes)..."
+        tar --extract --gzip \
+          --preserve-permissions \
+          --numeric-owner \
+          --acls \
+          --xattrs \
+          --xattrs-include="security.*" \
+          --file "{{ _img_storage }}/{{ _rocky_image_file }}" \
+          -C "{{ _work_dir }}/extracted"
+        echo "Extraction complete."
+      args:
+        chdir: "{{ _work_dir }}/extracted"
+      register: _extract_result
+      changed_when: true
+
+    - name: Check if wrapper already exists
+      ansible.builtin.stat:
+        path: "{{ _work_dir }}/extracted/usr/local/sbin/grub2-install"
+      register: _wrapper_stat
+
+    - name: Report wrapper status
+      ansible.builtin.debug:
+        msg: >-
+          grub2-install wrapper: {{ 'ALREADY EXISTS' if _wrapper_stat.stat.exists else 'not found — will create' }}
+
+    - name: Ensure /usr/local/sbin exists in extracted image
+      ansible.builtin.file:
+        path: "{{ _work_dir }}/extracted/usr/local/sbin"
+        state: directory
+        mode: "0755"
+
+    - name: Create grub2-install wrapper in extracted image
+      ansible.builtin.copy:
+        dest: "{{ _work_dir }}/extracted/usr/local/sbin/grub2-install"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Wrapper: Rocky 9's grub2-install refuses EFI install without --force.
+          # Curtin runs `chroot /target grub2-install --target=x86_64-efi ...` during
+          # RHEL curthooks — this wrapper in /usr/local/sbin (before /usr/sbin in PATH)
+          # adds --force transparently.
+          exec /usr/sbin/grub2-install --force "$@"
+
+    - name: Repack patched rocky-9 tgz
+      ansible.builtin.shell: |
+        echo "Repacking rocky-9 tgz (this may take a few minutes)..."
+        tar --create --gzip \
+          --preserve-permissions \
+          --numeric-owner \
+          --acls \
+          --xattrs \
+          --xattrs-include="security.*" \
+          --exclude="./proc/*" \
+          --exclude="./sys/*" \
+          --exclude="./dev/*" \
+          --exclude="./run/*" \
+          --exclude="./boot/efi" \
+          --file "{{ _work_dir }}/rocky-9-patched.tar.gz" \
+          -C "{{ _work_dir }}/extracted" .
+        echo "Repack complete: $(du -sh {{ _work_dir }}/rocky-9-patched.tar.gz | cut -f1)"
+      register: _repack_result
+      changed_when: true
+
+    - name: Get MaaS API key
+      ansible.builtin.shell: snap run maas apikey --username admin
+      register: _maas_api_key
+      changed_when: false
+      no_log: true
+
+    - name: Login to MaaS CLI
+      ansible.builtin.shell: >
+        maas login maas-admin http://localhost:5240/MAAS {{ _maas_api_key.stdout | trim }}
+      changed_when: false
+      no_log: true
+
+    - name: Delete existing rocky-9 boot resource (id={{ _rocky_resource_id }})
+      ansible.builtin.shell: |
+        maas maas-admin boot-resource delete {{ _rocky_resource_id }}
+        echo "Deleted boot resource {{ _rocky_resource_id }}"
+      register: _delete_result
+      changed_when: true
+
+    - name: Import patched rocky-9 tgz into MaaS
+      # filetype=tgz: root filesystem tarball (packer-maas approach).
+      # base_image=rhel/9: tells curtin to use RHEL-specific hooks for Rocky.
+      ansible.builtin.shell: |
+        echo "Importing patched rocky-9 tgz into MaaS..."
+        maas maas-admin boot-resources create \
+          name="{{ _rocky_resource_name }}" \
+          title="{{ _rocky_title }}" \
+          architecture="{{ _rocky_arch }}" \
+          filetype=tgz \
+          base_image=rhel/9 \
+          content@="{{ _work_dir }}/rocky-9-patched.tar.gz"
+        echo "Import complete."
+      register: _import_result
+      changed_when: true
+
+    - name: Trigger boot-resources import/sync
+      ansible.builtin.shell: maas maas-admin boot-resources import
+      register: _sync_result
+      changed_when: true
+      retries: 3
+      delay: 10
+      until: _sync_result.rc == 0
+
+    - name: Wait for rocky-9 to appear as Uploaded boot resource
+      ansible.builtin.shell: |
+        maas maas-admin boot-resources read | python3 -c "
+        import json, sys
+        resources = json.load(sys.stdin)
+        for r in resources:
+            name = r.get('name', '')
+            if 'rocky' in name.lower():
+                t = r.get('type', '')
+                print(f'  {name}: {t}')
+                if t == 'Uploaded':
+                    sys.exit(0)
+        sys.exit(1)
+        "
+      register: _wait_result
+      until: _wait_result.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Report import status
+      ansible.builtin.debug:
+        msg: "Rocky 9 boot resource re-imported successfully. Patched tgz includes grub2-install wrapper."
+
+    - name: Clean up work directory
+      ansible.builtin.file:
+        path: "{{ _work_dir }}"
+        state: absent

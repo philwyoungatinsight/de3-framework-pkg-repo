@@ -1,0 +1,122 @@
+---
+# Re-import the Rocky Linux 9 custom boot resource into MaaS.
+#
+# Use when: rocky-9 deployment fails with 'curtin command install' and the
+# existing boot resource may be stale or missing customizations.
+#
+# Steps:
+#   1. Verify rocky-9 is NOT in MaaS (should be pre-deleted before running)
+#   2. Install qemu-utils if missing
+#   3. Download, customize (grub2-efi, openssh, cloud-init, netplan stub),
+#      convert to ddgz, and import via maas CLI
+#
+# Config is read from pwy-home-lab-pkg.yaml to avoid hardcoded values.
+
+- name: Load rocky_images config from pwy-home-lab-pkg
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Extract rocky_images config from pwy-home-lab-pkg YAML via Python
+      # The YAML has keys with slashes (unit paths); Python handles this more
+      # reliably than Jinja2 iteration for nested path-keyed dicts.
+      ansible.builtin.shell: |
+        python3 -c "
+        import yaml, json, sys, os
+        path = os.path.join(os.environ.get('GIT_ROOT', ''), 'infra/pwy-home-lab-pkg/_config/pwy-home-lab-pkg.yaml')
+        with open(path) as f:
+            cfg = yaml.safe_load(f)
+        top = cfg.get('pwy-home-lab-pkg', {})
+        config_params = top.get('config_params', {})
+        rocky = []
+        for key, val in config_params.items():
+            if isinstance(val, dict) and 'maas' in key and key.endswith('configure-region'):
+                rocky = val.get('rocky_images', [])
+                break
+        print(json.dumps(rocky))
+        "
+      register: _rocky_images_raw
+      changed_when: false
+
+    - name: Set rocky_images_config fact
+      ansible.builtin.set_fact:
+        rocky_images_config: "{{ _rocky_images_raw.stdout | from_json }}"
+
+    - name: Show rocky_images to import
+      ansible.builtin.debug:
+        msg: "Will import: {{ rocky_images_config | map(attribute='name') | list }}"
+
+- name: Re-import rocky-9 on MaaS region server
+  hosts: maas_region
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Set facts for import tasks
+      ansible.builtin.set_fact:
+        _maas_url: "http://{{ ansible_host }}:5240/MAAS"
+        _maas_admin_username: "admin"
+        _maas_config:
+          rocky_images: "{{ hostvars['localhost']['rocky_images_config'] }}"
+          debian_images: []
+
+    - name: Get MaaS API key
+      ansible.builtin.command: maas apikey --username admin
+      become: true
+      register: _api_key
+      changed_when: false
+      no_log: true
+
+    - name: Login to MaaS CLI
+      ansible.builtin.command: >
+        maas login maas-admin {{ _maas_url }} {{ _api_key.stdout | trim }}
+      become: true
+      changed_when: false
+      no_log: true
+      retries: 3
+      delay: 5
+      until: _maas_login.rc == 0
+      register: _maas_login
+
+    - name: Verify rocky-9 is not already in MaaS
+      ansible.builtin.command: maas maas-admin boot-resources read
+      become: true
+      register: _br_check
+      changed_when: false
+
+    - name: Confirm rocky-9 is absent before import
+      ansible.builtin.fail:
+        msg: "rocky-9 still exists in MaaS — delete it first (maas admin boot-resource delete <id>)"
+      when: >-
+        (_br_check.stdout | from_json)
+        | selectattr('name', 'equalto', 'rocky-9') | list | length > 0
+
+    - name: Install qemu-utils for qcow2 handling
+      ansible.builtin.apt:
+        name:
+          - qemu-utils
+        state: present
+      become: true
+
+    - name: Import rocky-9 image
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', 'GIT_ROOT') }}/infra/maas-pkg/_tg_scripts/maas/configure-server/tasks/import-rocky-image.yaml"
+      loop: "{{ _maas_config.rocky_images }}"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        _rocky_tmp: "/var/snap/maas/common/rocky-import"
+        _existing_boot_resource_names: []
+
+    - name: Verify rocky-9 was imported
+      ansible.builtin.command: maas maas-admin boot-resources read
+      become: true
+      register: _br_verify
+      changed_when: false
+
+    - name: Report import result
+      ansible.builtin.debug:
+        msg: >-
+          Rocky resources now in MaaS:
+          {{ (_br_verify.stdout | from_json)
+             | selectattr('name', 'in', ['rocky-9', 'custom/rocky-9'])
+             | map(attribute='name') | list }}

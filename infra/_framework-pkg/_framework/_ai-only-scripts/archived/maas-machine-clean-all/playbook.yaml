@@ -1,0 +1,360 @@
+---
+# Full clean of all physical MaaS machine state.
+#
+# Resets the environment so that wave maas.machine.config.power can be
+# re-run from scratch (power-on → PXE enlistment → commission → deploy).
+#
+# Plays:
+#   1. localhost   — Load framework config; build machine list.
+#   2. maas_server — Power off machines; delete machine entries from MaaS.
+#   3. localhost   — Remove Terraform/tofu state for all machine units.
+#
+# Variables:
+#   skip_power_off  (bool, default false) — skip the power-off step
+#   dry_run         (bool, default false) — log actions but make no changes
+
+# ── Play 1: Load config ───────────────────────────────────────────────────────
+- name: Load framework config and build machine list
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Capture physical machines config (machine paths, MACs, power drivers)
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-machines/tasks/capture-config-fact.yaml"
+
+    - name: Assert machine list is not empty
+      ansible.builtin.assert:
+        that: (physical_machines_config | default([])) | length > 0
+        fail_msg: >
+          physical_machines_config is empty — check that
+          configure-physical-machines is configured and not skipped.
+
+    - name: Apply machines_filter if provided
+      ansible.builtin.set_fact:
+        physical_machines_config: >-
+          {{ physical_machines_config | selectattr('name', 'in', machines_filter) | list }}
+      when: machines_filter is defined and (machines_filter | length) > 0
+
+    - name: Show machines that will be cleaned
+      ansible.builtin.debug:
+        msg: |
+          Machines to clean ({{ physical_machines_config | length }}):
+          {% for m in physical_machines_config %}
+          - {{ m.name }}  MAC={{ m.pxe_mac_address | default('?') }}  power_type={{ m.power_type | default('?') }}  plug={{ m.smart_plug_host | default('') }}
+          {% endfor %}
+          dry_run={{ dry_run | default(false) }}
+          skip_power_off={{ skip_power_off | default(false) }}
+
+# ── Play 2: Clean MaaS server ─────────────────────────────────────────────────
+- name: Power off machines and delete MaaS entries
+  hosts: maas_region
+  gather_facts: false
+  become: false
+
+  vars:
+    _machines: "{{ hostvars['localhost']['physical_machines_config'] | default([]) }}"
+    _maas_admin: "{{ hostvars['localhost']['_maas_admin_username'] | default('admin') }}"
+    _proxy_base: "http://127.0.0.1:7050"
+    dry_run: false
+    skip_power_off: false
+
+  tasks:
+    # ── Login ──────────────────────────────────────────────────────────────────
+    - name: Login to MaaS CLI
+      ansible.builtin.shell: >
+        maas login {{ _maas_admin }} http://localhost:5240/MAAS
+        $(sudo maas apikey --username {{ _maas_admin }})
+      become: true
+      changed_when: false
+      no_log: true
+
+    # ── Enumerate current MaaS machine list ────────────────────────────────────
+    - name: Read all machines from MaaS API
+      ansible.builtin.shell: sudo maas {{ _maas_admin }} machines read 2>/dev/null
+      become: true
+      register: _all_machines_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Parse MaaS machine list
+      ansible.builtin.set_fact:
+        _maas_machines_json: "{{ _all_machines_raw.stdout | default('[]') | from_json }}"
+
+    # ── Power off each machine ─────────────────────────────────────────────────
+    - name: "Power off {{ machine.name }} via smart plug ({{ machine.smart_plug_host | default('') }})"
+      ansible.builtin.shell: |
+        PLUG="{{ machine.smart_plug_host | default('') }}"
+        TYPE="{{ machine.smart_plug_type | default('kasa') }}"
+        if [[ -z "$PLUG" ]]; then
+          echo "No smart_plug_host for {{ machine.name }} — skipping plug power-off"
+          exit 0
+        fi
+        echo "Powering off {{ machine.name }} plug $PLUG ($TYPE)..."
+        curl -sf -X POST "${_proxy_base}/power/off?host=${PLUG}&type=${TYPE}" \
+          && echo "Power-off sent to $PLUG" \
+          || echo "WARNING: smart plug power-off failed for {{ machine.name }} ($PLUG)"
+      loop: "{{ _machines }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.name }}"
+      when:
+        - not (skip_power_off | bool)
+        - not (dry_run | bool)
+        - machine.power_type | default('') in ['smart_plug']
+      failed_when: false
+      changed_when: true
+      vars:
+        _proxy_base: "http://127.0.0.1:7050"
+
+    - name: "Power off {{ machine.name }} via AMT ({{ machine.amt_address | default('') }})"
+      ansible.builtin.shell: |
+        AMT="{{ machine.amt_address | default('') }}"
+        PASS="{{ machine.power_pass | default('') }}"
+        if [[ -z "$AMT" ]]; then
+          echo "No amt_address for {{ machine.name }} — skipping AMT power-off"
+          exit 0
+        fi
+        SNAP=/snap/maas/current
+        WSMAN="$SNAP/usr/bin/wsman"
+        CONF="$SNAP/etc/openwsman/openwsman_client.conf"
+        ENDPOINT="https://{{ machine.power_user | default('admin') }}:${PASS}@${AMT}:16993"
+        export OPENSSL_CONF="/var/snap/maas/common/openssl-legacy.cnf"
+        export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu"
+        echo '<p:RequestPowerStateChange_INPUT xmlns:p="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService">
+          <p:PowerState>8</p:PowerState>
+          <p:ManagedElement xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+                            xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">
+            <wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+            <wsa:ReferenceParameters>
+              <wsman:ResourceURI>http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem</wsman:ResourceURI>
+              <wsman:SelectorSet>
+                <wsman:Selector Name="CreationClassName">CIM_ComputerSystem</wsman:Selector>
+                <wsman:Selector Name="Name">ManagedSystem</wsman:Selector>
+              </wsman:SelectorSet>
+            </wsa:ReferenceParameters>
+          </p:ManagedElement>
+        </p:RequestPowerStateChange_INPUT>' | \
+        "$WSMAN" -C "$CONF" --endpoint "$ENDPOINT" --noverifypeer --noverifyhost \
+          --input - invoke --method RequestPowerStateChange \
+          'http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService?SystemCreationClassName="CIM_ComputerSystem"&SystemName="Intel(r) AMT"&CreationClassName="CIM_PowerManagementService"&Name="Intel(r) AMT Power Management Service"' \
+          && echo "AMT power-off sent to $AMT" \
+          || echo "WARNING: AMT power-off failed for {{ machine.name }} ($AMT)"
+      loop: "{{ _machines }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.name }}"
+      when:
+        - not (skip_power_off | bool)
+        - not (dry_run | bool)
+        - machine.power_type | default('') == 'amt'
+      no_log: true
+      failed_when: false
+      changed_when: true
+
+    - name: Wait 5s for power-off commands to take effect
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - not (skip_power_off | bool)
+        - not (dry_run | bool)
+
+    # ── Delete each machine from MaaS ──────────────────────────────────────────
+    - name: Delete {{ machine.name }} from MaaS
+      ansible.builtin.shell: |
+        MAC="{{ machine.pxe_mac_address | lower }}"
+        # Find system_id for this machine by MAC
+        SYSTEM_ID=$(echo '{{ _maas_machines_json | to_json }}' | python3 -c "
+        import sys, json
+        machines = json.load(sys.stdin)
+        for m in machines:
+            for iface in m.get('interface_set', []):
+                if iface.get('mac_address', '').lower() == '$MAC':
+                    print(m['system_id'])
+                    break
+        ")
+        if [[ -z "$SYSTEM_ID" ]]; then
+          echo "{{ machine.name }} (MAC $MAC) not found in MaaS — already clean"
+          exit 0
+        fi
+        STATUS=$(echo '{{ _maas_machines_json | to_json }}' | python3 -c "
+        import sys, json
+        machines = json.load(sys.stdin)
+        for m in machines:
+            if m.get('system_id') == '$SYSTEM_ID':
+                print(m.get('status_name', 'Unknown'))
+        ")
+        echo "Found {{ machine.name }}: system_id=$SYSTEM_ID status=$STATUS"
+
+        if [[ "{{ dry_run | default(false) }}" == "True" ]]; then
+          echo "[dry_run] Would delete $SYSTEM_ID from MaaS"
+          exit 0
+        fi
+
+        # Use MaaS API to abort/release before deleting (best-effort, delete proceeds regardless).
+        # abort: Deploying/Commissioning → Failed; release: Deployed/Allocated → Ready.
+        if echo "$STATUS" | grep -qE "^(Deploying|Commissioning|Testing)"; then
+          sudo maas {{ _maas_admin }} machine abort "$SYSTEM_ID" 2>/dev/null || true
+          sleep 3
+        fi
+        if echo "$STATUS" | grep -qE "^(Deployed|Allocated|Reserved)"; then
+          sudo maas {{ _maas_admin }} machine release "$SYSTEM_ID" 2>/dev/null || true
+          sleep 3
+        fi
+
+        sudo maas {{ _maas_admin }} machine delete "$SYSTEM_ID" 2>&1 \
+          && echo "Deleted $SYSTEM_ID ({{ machine.name }}) from MaaS" \
+          || echo "WARNING: delete failed for $SYSTEM_ID ({{ machine.name }})"
+      become: true
+      loop: "{{ _machines }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.name }}"
+      failed_when: false
+      changed_when: true
+
+    - name: Summary (MaaS side)
+      ansible.builtin.debug:
+        msg: |
+          MaaS clean complete for {{ _machines | length }} machine(s).
+          Machines powered off (unless skip_power_off=true) and deleted from MaaS.
+
+# ── Play 3: Clean Terraform state ─────────────────────────────────────────────
+- name: Remove Terraform state for all machine units and configure-physical-machines
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    _machines: "{{ hostvars['localhost']['physical_machines_config'] | default([]) }}"
+    dry_run: false
+
+  tasks:
+    # Remove state for each individual machine unit.
+    # Resources: maas_machine.this, maas_instance.this, null_resource.commission,
+    #            null_resource.set_deploy_osystem[*], null_resource.pre_deploy_kick,
+    #            null_resource.release_with_erase
+    - name: Remove Terraform state for {{ machine.name }} unit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        GIT_ROOT="$(git rev-parse --show-toplevel)"
+        source "$GIT_ROOT/set_env.sh"
+
+        UNIT_DIR="$_INFRA_DIR/{{ machine.path }}"
+        if [[ ! -d "$UNIT_DIR" ]]; then
+          echo "Unit dir not found: $UNIT_DIR — skipping"
+          exit 0
+        fi
+
+        if [[ "{{ dry_run | default(false) }}" == "True" ]]; then
+          echo "[dry_run] Would clean TF state in $UNIT_DIR"
+          exit 0
+        fi
+
+        cd "$UNIT_DIR"
+        RESOURCES=(
+          "maas_machine.this"
+          "maas_instance.this"
+          "null_resource.commission"
+          "null_resource.pre_deploy_kick"
+          "null_resource.release_with_erase"
+        )
+        for res in "${RESOURCES[@]}"; do
+          terragrunt state rm "$res" 2>&1 \
+            && echo "Removed $res from {{ machine.name }} state" \
+            || echo "(not in state: $res)"
+        done
+
+        # set_deploy_osystem may have multiple indexed instances — remove all
+        terragrunt state list 2>/dev/null \
+          | grep "null_resource.set_deploy_osystem" \
+          | while IFS= read -r res; do
+              terragrunt state rm "$res" 2>&1 \
+                && echo "Removed $res from {{ machine.name }} state" \
+                || echo "(not in state: $res)"
+            done || true
+      args:
+        executable: /bin/bash
+      loop: "{{ _machines }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.name }}"
+      register: _machine_state_rm
+      failed_when: false
+      changed_when: true
+
+    - name: Show machine state-rm results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | default([]) }}"
+      loop: "{{ _machine_state_rm.results }}"
+      loop_control:
+        label: "{{ item.machine.name }}"
+
+    # Remove state for the configure-physical-machines aggregating unit.
+    # Resource: null_resource.this
+    - name: Remove Terraform state for configure-physical-machines unit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        GIT_ROOT="$(git rev-parse --show-toplevel)"
+        source "$GIT_ROOT/set_env.sh"
+
+        # Discover the configure-physical-machines unit path from physical_machines_config
+        # The machine paths are like pwy-home-lab-pkg/_stack/maas/pwy-homelab/machines/<name>
+        # The configure-physical-machines unit is at the null provider: same pkg + env
+        MACHINE_PATH="{{ _machines[0].path | default('') }}"
+        # e.g. pwy-home-lab-pkg/_stack/maas/pwy-homelab/machines/ms01-01
+        # Strip _stack/maas/.../machines/<name> → add _stack/null/<env>/configure-physical-machines
+        PKG=$(echo "$MACHINE_PATH" | cut -d/ -f1)
+        ENV=$(echo "$MACHINE_PATH" | cut -d/ -f4)
+        CPM_PATH="$PKG/_stack/null/$ENV/configure-physical-machines"
+        UNIT_DIR="$_INFRA_DIR/$CPM_PATH"
+
+        if [[ ! -d "$UNIT_DIR" ]]; then
+          echo "configure-physical-machines unit not found at $UNIT_DIR — skipping"
+          exit 0
+        fi
+
+        if [[ "{{ dry_run | default(false) }}" == "True" ]]; then
+          echo "[dry_run] Would clean TF state in $UNIT_DIR"
+          exit 0
+        fi
+
+        cd "$UNIT_DIR"
+        terragrunt state rm "null_resource.this" 2>&1 \
+          && echo "Removed null_resource.this from configure-physical-machines state" \
+          || echo "(not in state: null_resource.this)"
+      args:
+        executable: /bin/bash
+      register: _cpm_state_rm
+      failed_when: false
+      changed_when: true
+      when: (_machines | length) > 0
+
+    - name: Show configure-physical-machines state-rm result
+      ansible.builtin.debug:
+        msg: "{{ _cpm_state_rm.stdout_lines | default([]) }}"
+      when: _cpm_state_rm is defined
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════╗
+          ║   MaaS machine clean-all complete                  ║
+          ╠════════════════════════════════════════════════════╣
+          ║ Machines cleaned: {{ _machines | map(attribute='name') | join(', ') }}
+          ║
+          ║ Next steps:
+          ║  1. Verify machines are powered OFF (check smart plug app / AMT)
+          ║  2. If disk wipe needed: run playbook.wipe-hosts.yaml first
+          ║     (power on machine → wait for PXE boot → run wipe)
+          ║  3. Run: ./run --apply --start-at 9
+          ║     This will:
+          ║     - Power on machines via smart plug (auto-import step)
+          ║     - Wait for PXE enlistment in MaaS
+          ║     - Commission and deploy
+          ╚════════════════════════════════════════════════════╝

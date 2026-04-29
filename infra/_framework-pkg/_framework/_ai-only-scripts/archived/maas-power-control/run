@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# maas-power-control/run
+#
+# MaaS machine power control via smart plug and MaaS API.
+#
+# Usage:
+#   ACTION=bounce SYSTEM_ID=hy8dqm PLUG_HOST=192.168.1.231 PLUG_TYPE=tapo ./run
+#   ACTION=status SYSTEM_ID=hy8dqm ./run
+#   ACTION=power-on SYSTEM_ID=hy8dqm ./run
+#   ACTION=power-off SYSTEM_ID=hy8dqm ./run
+#
+# Environment:
+#   SYSTEM_ID    MaaS machine system ID (required)
+#   ACTION       bounce | power-on | power-off | status (required)
+#   MAAS_HOST    MaaS server IP (default: 10.0.10.11)
+#   PLUG_HOST    Smart plug IP (required for bounce)
+#   PLUG_TYPE    kasa or tapo (required for bounce)
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=set_env.sh
+. "${GIT_ROOT}/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "${_UTILITIES_DIR}/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+_activate_ansible_locally "${SCRIPT_DIR}"
+
+export MAAS_HOST="${MAAS_HOST:-10.0.10.11}"
+export SYSTEM_ID="${SYSTEM_ID:?SYSTEM_ID is required}"
+export ACTION="${ACTION:?ACTION is required (bounce|power-on|power-off|status)}"
+export PLUG_HOST="${PLUG_HOST:-}"
+export PLUG_TYPE="${PLUG_TYPE:-tapo}"
+
+ansible-playbook \
+    -i localhost, \
+    "${SCRIPT_DIR}/playbook.yaml" \
+    "$@"

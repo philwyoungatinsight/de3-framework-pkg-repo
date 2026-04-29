@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# configure-plain-host-ovs — apply declarative OVS bridge config to a plain (non-Proxmox)
+# managed host using ovs-vsctl + distro-native IP persistence (netplan on Ubuntu,
+# nmcli on Rocky/RHEL).
+#
+# The `bridges:` list is read from the machine's entry in pwy-home-lab-pkg.yaml.
+# Only bridges with technology: ovs are processed. Bridges with nic: "" are created
+# without a physical uplink and emit a warning.
+#
+# Usage:
+#   MACHINE=ms01-03 ./run              # configure OVS on ms01-03
+#   MACHINE=ms01-02 ./run              # configure OVS on ms01-02
+#
+# Prerequisites:
+#   - Target machine is Deployed (SSH accessible via cloud_public_ip)
+#   - bridges: list is populated in pwy-home-lab-pkg.yaml for the machine
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "$GIT_ROOT/set_env.sh"
+
+_activate_ansible_locally
+
+: "${MACHINE:?Usage: MACHINE=ms01-03 ./run}"
+
+export MACHINE
+export ANSIBLE_HOST_KEY_CHECKING=False
+export ANSIBLE_PYTHON_INTERPRETER=auto
+
+echo "=== Configuring OVS on plain host: $MACHINE ==="
+ansible-playbook \
+  "$SCRIPT_DIR/playbook.yaml" \
+  "$@"

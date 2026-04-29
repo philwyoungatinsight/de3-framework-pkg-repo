@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Reboot ms01-02 from its current Ubuntu OS to reset the AMT firmware TLS stack.
+# The AMT firmware on ms01-02 is accepting TCP connections but hanging during
+# TLS handshake; a reboot resets the AMT firmware.
+# Usage: ./run
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=/dev/null
+. "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+INVENTORY_FILE="${_DYNAMIC_DIR}/ansible/inventory/hosts.yml"
+
+if [ ! -f "${INVENTORY_FILE}" ]; then
+    echo "Inventory not found — generating..."
+    "$_GENERATE_INVENTORY" --build
+fi
+
+_activate_ansible_locally "$SCRIPT_DIR"
+
+ansible-playbook \
+  -i "$SCRIPT_DIR/inventory.yml" \
+  "$SCRIPT_DIR/playbook.yaml"

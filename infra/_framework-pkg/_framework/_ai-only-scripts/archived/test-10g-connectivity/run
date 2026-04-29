@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# test-10g-connectivity — validate 10G switching throughput via CRS317.
+#
+# Usage:
+#   ./run
+#   SERVER_HOST=10.0.10.115 CLIENT_HOST=10.0.10.116 ./run
+#
+# Requires:
+#   - CRS317 cabled and configured (network.mikrotik wave applied)
+#   - Proxmox vmbr1 (cloud) bridge configured on both SERVER_HOST and CLIENT_HOST
+#
+# Tests VLAN 10 (cloud_public) and asserts >= 9.0 Gbps.
+# VLAN 14 (storage) test is deferred — not enough SFP cables yet.
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "$GIT_ROOT/set_env.sh"
+
+_activate_ansible_locally
+
+cd "$(dirname "$0")"
+ansible-playbook playbook.yaml

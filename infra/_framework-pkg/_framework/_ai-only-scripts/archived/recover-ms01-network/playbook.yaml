@@ -1,0 +1,108 @@
+---
+# Recover ms01-01 after it lost network due to systemd-networkd being stopped.
+# Releases ms01-01 in MaaS so it can be redeployed cleanly by the next wave run.
+#
+# Prerequisites:
+#   - maas-server-1 is reachable at 10.0.10.11
+#   - ms01-01 power is managed by smart plug (will be powered off by MaaS release)
+#
+# After this runs:
+#   - ms01-01 is in "Ready" state in MaaS (powered off)
+#   - Re-run: ./run -a -w maas.machine.config.power  (redeploys Debian trixie)
+#   - Re-run: ./run -a -w hypervisor.proxmox.install (installs Proxmox with fixed playbook)
+
+- name: Load framework config and find ms01-01
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Capture MaaS config facts
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-machines/tasks/capture-config-fact.yaml"
+
+    - name: Find ms01-01 config entry
+      ansible.builtin.set_fact:
+        _ms01_entry: >-
+          {%- set result = {} -%}
+          {%- set params = _tg_providers.maas.config_params | default({}) -%}
+          {%- for path, cfg in params.items() -%}
+            {%- if cfg is mapping and path.split('/')[-1] == 'ms01-01' -%}
+              {%- set _ = result.update({'path': path, 'cfg': cfg}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Assert ms01-01 config found
+      ansible.builtin.assert:
+        that: _ms01_entry | length > 0
+        fail_msg: "Could not find ms01-01 in providers.maas.config_params"
+
+- name: Release ms01-01 in MaaS so it can be redeployed
+  hosts: maas_region
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Login to MaaS CLI
+      ansible.builtin.shell: >
+        maas login admin http://localhost:5240/MAAS
+        $(maas apikey --username admin)
+      become: true
+      changed_when: false
+      no_log: true
+      register: _login
+      failed_when: _login.rc != 0
+
+    - name: Find ms01-01 system_id
+      ansible.builtin.shell: >
+        sudo maas admin machines read
+        | python3 -c "import sys,json; d=json.load(sys.stdin); m=[x for x in d if x['hostname']=='ms01-01']; print(m[0]['system_id'], m[0]['status_name']) if m else print('NOT_FOUND')"
+      register: _machine_info
+      changed_when: false
+      become: true
+
+    - name: Parse machine info
+      ansible.builtin.set_fact:
+        _system_id: "{{ _machine_info.stdout.split()[0] }}"
+        _status: "{{ _machine_info.stdout.split()[1] }}"
+
+    - name: Report current status
+      ansible.builtin.debug:
+        msg: "ms01-01: system_id={{ _system_id }}, status={{ _status }}"
+
+    - name: Skip release if already Ready
+      ansible.builtin.meta: end_play
+      when: _status == 'Ready'
+
+    - name: Fail if machine is not in a releasable state
+      ansible.builtin.fail:
+        msg: >
+          ms01-01 is in status '{{ _status }}'. Expected 'Deployed'.
+          Manual intervention may be required.
+      when: _status not in ['Deployed', 'Broken', 'Failed deployment']
+
+    - name: Release ms01-01 (powers off via smart plug, marks Ready)
+      ansible.builtin.shell: >
+        sudo maas admin machine release {{ _system_id }} erase=false
+      become: true
+      register: _release_result
+      changed_when: true
+      failed_when: _release_result.rc != 0
+
+    - name: Wait for ms01-01 to reach Ready state
+      ansible.builtin.shell: >
+        sudo maas admin machine read {{ _system_id }}
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['status_name'])"
+      become: true
+      register: _status_check
+      until: _status_check.stdout | trim == 'Ready'
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Report final status
+      ansible.builtin.debug:
+        msg: "ms01-01 is now Ready — safe to re-run maas.machine.config.power and hypervisor.proxmox.install waves"

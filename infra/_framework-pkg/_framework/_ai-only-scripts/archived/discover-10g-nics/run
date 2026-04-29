@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# discover-10g-nics — find 10G SFP+ NIC names on Proxmox hosts.
+#
+# Usage:
+#   ./run                                  # all known hosts (pve-1 + ms01-01)
+#   HOSTS="10.0.10.115,10.0.10.116" ./run  # explicit host list
+#
+# Results tell you the Linux interface names to fill into pwy-home-lab-pkg.yaml:
+#   nic_10g_cloud: <interface_A>   # SFP+ port connected to CRS317 cloud port
+#   nic_10g_storage: <interface_B> # SFP+ port connected to CRS317 storage port
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "$GIT_ROOT/set_env.sh"
+
+_activate_ansible_locally
+
+cd "$(dirname "$0")"
+ansible-playbook playbook.yaml \
+  -e "proxmox_hosts=[\"${HOSTS:-10.0.10.115,10.0.10.116}\"]"

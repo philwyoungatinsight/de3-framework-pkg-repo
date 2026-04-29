@@ -1,0 +1,208 @@
+---
+# upgrade-to-7 — installs RouterOS 7.x from the MikroTik download server.
+#
+# Prerequisites:
+#   - Switch is on RouterOS 6.49.19 (latest 6.x)
+#   - Switch has internet access via temp default route + DNS (set in previous step)
+#
+# Method: /tool fetch downloads routeros-7.x.y-arm.npk directly from
+# download.mikrotik.com. RouterOS installs any .npk in /files on the next reboot.
+#
+# The URL uses the "STABLE" redirect that MikroTik provides for the latest stable
+# 7.x package. If that fails, set ROUTEROS_7_VERSION env var to a known version
+# (e.g. "7.18.1") to use the direct versioned URL.
+
+- name: Phase A — setup
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.add_host:
+        name: ros_switch
+        groups: [ros_switches]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 300
+
+- name: Phase B — download ROS 7 package and reboot
+  hosts: ros_switches
+  gather_facts: false
+  vars:
+    mgmt_gateway: "{{ lookup('env', 'ROUTEROS_MGMT_GATEWAY') | default('10.0.11.1', true) }}"
+    ros7_version: "{{ lookup('env', 'ROUTEROS_7_VERSION') | default('', true) }}"
+  tasks:
+    - name: Confirm current version is 6.x
+      community.routeros.command:
+        commands: [/system resource print]
+      register: cur_ver
+
+    - name: Display current version
+      ansible.builtin.debug:
+        msg: "{{ cur_ver.stdout[0] }}"
+
+    - name: Already on RouterOS 7.x — nothing to do
+      ansible.builtin.meta: end_play
+      when: "'version: 7.' in cur_ver.stdout[0]"
+
+    - name: Re-add default route (may have been cleared by previous reboot)
+      community.routeros.command:
+        commands:
+          - /ip route add dst-address=0.0.0.0/0 gateway={{ mgmt_gateway }} comment=temp-upgrade-route
+      ignore_errors: true
+
+    - name: Re-set DNS (may have been cleared by previous reboot)
+      community.routeros.command:
+        commands: ["/ip dns set servers=8.8.8.8"]
+
+    - name: Verify internet
+      community.routeros.command:
+        commands: ["/ping address=8.8.8.8 count=3 interval=0.5"]
+      register: ping_check
+
+    - name: Fail if no internet
+      ansible.builtin.fail:
+        msg: "No internet from switch — default route via {{ mgmt_gateway }} not working."
+      when: "'received=3' not in ping_check.stdout[0]"
+
+    # Default to 7.22.1 (latest stable as of 2026-04-14) if no version override is set.
+    # To use a different version: ROUTEROS_7_VERSION=7.X.Y ./run
+    - name: "Download RouterOS 7.x package"
+      community.routeros.command:
+        commands:
+          - >
+            /tool fetch
+            url="https://download.mikrotik.com/routeros/{{ ros7_version if ros7_version != '' else '7.22.1' }}/routeros-{{ ros7_version if ros7_version != '' else '7.22.1' }}-arm.npk"
+            dst-path=routeros7.npk
+            mode=https
+            check-certificate=no
+      register: fetch_result
+      ignore_errors: true
+
+    - name: Show fetch result
+      ansible.builtin.debug:
+        msg: "Fetch result: {{ fetch_result.stdout | default('(no output)') }}"
+
+    - name: Check that the file was actually downloaded
+      community.routeros.command:
+        commands: ["/file print detail where name=routeros7.npk"]
+      register: file_check
+
+    - name: Show file info
+      ansible.builtin.debug:
+        msg: "Downloaded file: {{ file_check.stdout[0] }}"
+
+    - name: Fail if file not downloaded
+      ansible.builtin.fail:
+        msg: >
+          routeros7.npk was not downloaded. Check internet access and URL.
+          Set ROUTEROS_7_VERSION=7.X.Y env var to override the version and retry.
+          (e.g. ROUTEROS_7_VERSION=7.17.1 ./run)
+      when: "'routeros7.npk' not in file_check.stdout[0]"
+
+    # Use paramiko exec_command (no PTY) to avoid the RouterOS CLI confirmation
+    # prompt "[y/N]" that community.routeros.command waits for and times out on.
+    - name: Reboot to install ROS 7 (paramiko exec, no PTY = no confirmation prompt)
+      ansible.builtin.shell: |
+        python3 -c "
+        import paramiko, time, os
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        c.connect(os.environ['ROUTEROS_HOST'], username=os.environ['ROUTEROS_USER'],
+                  password=os.environ['ROUTEROS_PASS'], look_for_keys=False, allow_agent=False)
+        c.exec_command('/system reboot')
+        time.sleep(3)
+        c.close()
+        "
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Reboot triggered
+      ansible.builtin.debug:
+        msg: "Switch rebooting to install RouterOS 7.x..."
+
+- name: Phase C — wait for reboot and verify ROS 7
+  hosts: localhost
+  gather_facts: false
+  vars:
+    reboot_wait: "{{ lookup('env', '_ROUTEROS_REBOOT_WAIT_TIMEOUT') | default('300', true) | int }}"
+  tasks:
+    - name: "Wait up to {{ reboot_wait }}s for SSH after ROS 7 boot"
+      ansible.builtin.wait_for:
+        host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        port: 22
+        delay: 30
+        timeout: "{{ reboot_wait }}"
+        state: started
+        sleep: 15
+
+    - name: Extra 25s for RouterOS 7 to finish initial boot
+      ansible.builtin.pause:
+        seconds: 25
+
+    - name: Register switch for verification
+      ansible.builtin.add_host:
+        name: ros_switch_verify
+        groups: [ros_switches_verify]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 120
+
+- name: Phase D — verify and clean up
+  hosts: ros_switches_verify
+  gather_facts: false
+  tasks:
+    - name: Get final version
+      community.routeros.command:
+        commands: [/system resource print]
+      register: ros_final
+
+    - name: Display final version
+      ansible.builtin.debug:
+        msg: "{{ ros_final.stdout[0] }}"
+
+    - name: Fail if still not on RouterOS 7.x
+      ansible.builtin.fail:
+        msg: "Still not on RouterOS 7.x. Output: {{ ros_final.stdout[0][:300] }}"
+      when: "'version: 7.' not in ros_final.stdout[0]"
+
+    - name: Remove temporary default route
+      community.routeros.command:
+        commands: ["/ip route remove [find comment=temp-upgrade-route]"]
+      ignore_errors: true
+
+    # api-ssl requires a certificate or the TLS handshake fails; ROS 7 ships with none assigned.
+    - name: Create self-signed certificate for api-ssl (idempotent — ignored if already exists)
+      community.routeros.command:
+        commands:
+          - /certificate add name=api-ssl-cert common-name=192.168.88.1 key-size=2048 days-valid=3650
+      ignore_errors: true
+
+    - name: Sign the certificate (takes ~5s for key generation)
+      community.routeros.command:
+        commands: [/certificate sign api-ssl-cert]
+      register: cert_sign
+      ignore_errors: true
+
+    - name: Wait for certificate signing to complete
+      ansible.builtin.pause:
+        seconds: 8
+
+    - name: Assign certificate to api-ssl service
+      community.routeros.command:
+        commands: ["/ip service set api-ssl certificate=api-ssl-cert"]
+      ignore_errors: true
+
+    - name: SUCCESS
+      ansible.builtin.debug:
+        msg: >
+          RouterOS 7 upgrade complete!
+          {{ ros_final.stdout[0] | regex_search('version: [0-9.]+[^\n]*') | default('') }}
+          Certificate api-ssl-cert assigned to api-ssl (port 8729).
+          Next: update mikrotik-pkg.yaml endpoint to apis://192.168.88.1:8729 and run the wave.

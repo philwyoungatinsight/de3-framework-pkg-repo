@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# gpg-mgr — ensure gpg-agent TTY is current and all signing keys are unlocked.
+#
+# Called automatically from set_env.sh on every `source set_env.sh`. Fast-exits if
+# all keys are already cached in the agent. If any key needs a passphrase, prompts
+# interactively. Requires GPG_TTY to be set in the environment (set_env.sh does this).
+#
+# Usage:
+#   gpg-mgr -e|--ensure   # update TTY, unlock any uncached keys (used by set_env.sh)
+#   gpg-mgr -c|--check    # exit 0 if all keys cached, exit 1 if any are not
+#   gpg-mgr -u|--unlock   # update TTY, unlock all keys unconditionally
+
+set -euo pipefail
+
+_gpg_update_tty() {
+    # Tell the running gpg-agent about the current terminal so pinentry prompts
+    # appear in the right window. No-ops gracefully if the agent isn't running.
+    gpg-connect-agent updatestartuptty /bye >/dev/null 2>&1 || true
+}
+
+_gpg_restart_agent() {
+    # Kill and restart the agent — used only as a fallback when an unlock attempt
+    # fails, which indicates the agent itself is in a broken state.
+    echo "gpg-mgr: restarting gpg-agent (unlock failed)" >&2
+    gpgconf --kill gpg-agent 2>/dev/null || true
+    gpg-connect-agent /bye >/dev/null 2>&1 || true  # starts a fresh agent
+    _gpg_update_tty
+}
+
+_gpg_list_key_ids() {
+    gpg --list-secret-keys --with-colons 2>/dev/null | grep "^sec" | cut -d: -f5
+}
+
+_gpg_all_cached() {
+    # Returns 0 if every secret key is already cached in the agent (no passphrase
+    # needed), 1 if any key is not cached. Uses --batch --no-tty so gpg fails
+    # rather than prompting — safe to call non-interactively.
+    local tmpfile
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' RETURN
+    printf 'gpg-mgr-check\n' > "$tmpfile"
+
+    local all_ok=0
+    while IFS= read -r key_id; do
+        [[ -z "$key_id" ]] && continue
+        if ! gpg --batch --no-tty --armor --detach-sign --local-user "$key_id" --yes \
+                 "$tmpfile" >/dev/null 2>&1; then
+            all_ok=1
+            break
+        fi
+    done < <(_gpg_list_key_ids)
+    return $all_ok
+}
+
+_gpg_unlock_all() {
+    # Interactive unlock for all secret keys. If an unlock attempt fails, restart
+    # the agent once and retry. Reports failures but does not abort (the caller,
+    # set_env.sh, must not fail on a partial unlock).
+    local tmpfile
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' RETURN
+    printf 'gpg-mgr-unlock\n' > "$tmpfile"
+
+    local found=0
+    local restarted=0
+    while IFS= read -r key_id; do
+        [[ -z "$key_id" ]] && continue
+        found=1
+        local user_id
+        user_id="$(gpg --list-secret-keys --with-colons "$key_id" 2>/dev/null \
+                   | grep "^uid" | head -n1 | cut -d: -f10)"
+        echo "gpg-mgr: unlocking key $key_id ($user_id)" >&2
+        if gpg --armor --detach-sign --local-user "$key_id" --yes "$tmpfile" >/dev/null 2>&1; then
+            echo "gpg-mgr:   v cached" >&2
+        else
+            if [[ $restarted -eq 0 ]]; then
+                restarted=1
+                _gpg_restart_agent
+                if gpg --armor --detach-sign --local-user "$key_id" --yes "$tmpfile" >/dev/null 2>&1; then
+                    echo "gpg-mgr:   v cached (after agent restart)" >&2
+                    continue
+                fi
+            fi
+            echo "gpg-mgr:   x failed or cancelled" >&2
+        fi
+    done < <(_gpg_list_key_ids)
+
+    if [[ $found -eq 0 ]]; then
+        echo "gpg-mgr: no secret keys found" >&2
+    fi
+}
+
+_gpg_has_tty() {
+    [[ -n "${GPG_TTY:-}" ]] && [[ "$GPG_TTY" != "not a tty" ]]
+}
+
+_usage() {
+    echo "Usage: gpg-mgr -e|--ensure | -c|--check | -u|--unlock | -h|--help" >&2
+}
+
+cmd=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -e|--ensure) cmd="ensure"; shift ;;
+        -c|--check)  cmd="check";  shift ;;
+        -u|--unlock) cmd="unlock"; shift ;;
+        -h|--help)   _usage; exit 0 ;;
+        --)          shift; break ;;
+        -*) echo "gpg-mgr: unknown option: $1" >&2; _usage; exit 1 ;;
+        *)  echo "gpg-mgr: unexpected argument: $1" >&2; _usage; exit 1 ;;
+    esac
+done
+
+if [[ -z "$cmd" ]]; then
+    _usage
+    exit 1
+fi
+
+case "$cmd" in
+    ensure)
+        _gpg_update_tty
+        if _gpg_all_cached; then
+            exit 0  # all keys cached — nothing to do
+        fi
+        if ! _gpg_has_tty; then
+            echo "gpg-mgr: warning: no TTY available and keys are not cached" \
+                 "— SOPS decryption may fail" >&2
+            exit 0
+        fi
+        _gpg_unlock_all
+        ;;
+    check)
+        _gpg_update_tty
+        _gpg_all_cached
+        ;;
+    unlock)
+        _gpg_update_tty
+        _gpg_unlock_all
+        ;;
+esac

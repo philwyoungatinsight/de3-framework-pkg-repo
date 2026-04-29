@@ -1,0 +1,11 @@
+---
+# Static inventory for ms01-02 reboot script.
+# ms01-02 is not yet in MaaS so it doesn't appear in the dynamic inventory.
+# It is reachable at its DHCP reservation IP (10.0.12.239, provisioning VLAN)
+# via the MaaS server jump box at 10.0.10.11.
+all:
+  hosts:
+    ms01-02:
+      ansible_host: 10.0.12.239
+      ansible_user: ubuntu
+      ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -J ubuntu@10.0.10.11"

@@ -1,0 +1,75 @@
+---
+# discover-10g-nics — finds the Linux NIC names for 10G SFP+ interfaces on
+# Proxmox hosts so they can be recorded in pwy-home-lab-pkg.yaml config.
+#
+# What it checks:
+#   - All physical NICs with a detected link speed of 10000 Mb/s
+#   - Reports interface name, MAC address, driver, and current link state
+#   - Skips virtual/bridge/bond/vlan interfaces
+#
+# Prerequisites:
+#   - Host must be reachable via SSH
+#   - ethtool must be installed (standard on Proxmox/Debian)
+#
+# Usage:
+#   HOSTS="10.0.10.115,10.0.10.116" ./run
+#   # or just ./run for all known Proxmox hosts
+
+- name: Discover 10G SFP+ NICs on Proxmox hosts
+  hosts: localhost
+  gather_facts: false
+  vars:
+    proxmox_hosts: "{{ lookup('env', 'HOSTS') | default('10.0.10.115,10.0.10.116', true) | split(',') }}"
+    ssh_user: root
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    jump_host: ""
+
+  tasks:
+  - name: Enumerate 10G NICs on each host
+    ansible.builtin.shell: |
+      set -e
+      HOST="{{ item }}"
+      echo "=== Host: $HOST ==="
+      ssh {{ ssh_opts }} \
+        {% if jump_host %}"-J {{ jump_host }}"{% endif %} \
+        {{ ssh_user }}@$HOST bash << 'REMOTE'
+      set -e
+      echo "--- Physical NICs ---"
+      for nic in /sys/class/net/*/; do
+        name=$(basename "$nic")
+        # Skip virtual interfaces (loopback, bridges, vlans, bonds, taps, veth)
+        case "$name" in lo|vmbr*|vlan*|bond*|tap*|fwpr*|fwln*|veth*) continue;; esac
+        # Only physical interfaces (have a /device symlink)
+        [ -e "$nic/device" ] || continue
+        speed=$(cat "$nic/speed" 2>/dev/null || echo "unknown")
+        [ "$speed" = "10000" ] || continue
+        mac=$(cat "$nic/address" 2>/dev/null || echo "unknown")
+        state=$(cat "$nic/operstate" 2>/dev/null || echo "unknown")
+        driver=$(ethtool -i "$name" 2>/dev/null | awk '/^driver:/{print $2}' || echo "unknown")
+        echo "  NIC: $name  MAC: $mac  speed: ${speed}Mbps  link: $state  driver: $driver"
+      done
+      REMOTE
+    register: nic_results
+    loop: "{{ proxmox_hosts }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: Print NIC discovery results
+    ansible.builtin.debug:
+      msg: "{{ item.stdout_lines }}"
+    loop: "{{ nic_results.results }}"
+    loop_control:
+      label: "host {{ item.item }}"
+
+  - name: Print next steps
+    ansible.builtin.debug:
+      msg: |
+        Next steps:
+        1. For each host, identify which NIC is for cloud_public (will carry VLAN 10)
+           and which is for storage (will carry VLAN 14). Use the port order on the
+           physical chassis: SFP+ port A = cloud, SFP+ port B = storage.
+        2. Update pwy-home-lab-pkg.yaml for each host:
+             pwy-home-lab-pkg/_stack/proxmox/pwy-homelab/pve-nodes/<node>:
+               nic_10g_cloud: "<interface_name_A>"
+               nic_10g_storage: "<interface_name_B>"
+        3. Run scripts/ai-only-scripts/configure-proxmox-10g-bridges/run

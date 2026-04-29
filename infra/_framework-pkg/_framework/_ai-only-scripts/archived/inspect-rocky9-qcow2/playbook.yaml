@@ -1,0 +1,162 @@
+---
+# Inspect Rocky 9 GenericCloud qcow2 partition layout on maas-region-1.
+# Reports partition layout and root filesystem contents so we can verify
+# which partition is / vs /boot vs LVM PV.
+
+- name: Load config to get Rocky 9 image URL
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Extract rocky-9 image URL
+      ansible.builtin.set_fact:
+        rocky9_url: >-
+          {{
+            (_all_config_params.values()
+             | selectattr('rocky_images', 'defined')
+             | map(attribute='rocky_images')
+             | flatten
+             | selectattr('name', 'equalto', 'custom/rocky-9')
+             | map(attribute='url')
+             | list
+             | first
+            )
+          }}
+    - name: Show URL
+      ansible.builtin.debug:
+        msg: "Rocky 9 URL: {{ rocky9_url }}"
+
+- name: Inspect Rocky 9 qcow2 on maas-region-1
+  hosts: maas-region-1
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    rocky9_url: "{{ hostvars['localhost']['rocky9_url'] }}"
+    qcow2: /tmp/inspect-rocky9.qcow2
+    mnt: /tmp/inspect-rocky9-mnt
+  tasks:
+    - name: Ensure required tools are present
+      ansible.builtin.apt:
+        name: [qemu-utils, kpartx, lvm2]
+        state: present
+      become: true
+
+    - name: Download Rocky 9 qcow2 (if not already present)
+      ansible.builtin.shell: |
+        if [[ -f {{ qcow2 }} ]]; then
+          echo "already present"
+        else
+          wget --tries=3 --waitretry=10 --timeout=120 -q -O {{ qcow2 }}.tmp "{{ rocky9_url }}"
+          mv {{ qcow2 }}.tmp {{ qcow2 }}
+          echo "downloaded"
+        fi
+      changed_when: true
+      register: _download
+
+    - name: Show download status
+      ansible.builtin.debug:
+        msg: "{{ _download.stdout_lines }}"
+
+    - name: Load nbd kernel module
+      ansible.builtin.shell: |
+        if lsmod | grep -q '^nbd '; then rmmod nbd 2>/dev/null || true; fi
+        modprobe nbd max_part=63
+      become: true
+      changed_when: false
+
+    - name: Disconnect any existing nbd0
+      ansible.builtin.shell: qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true
+      become: true
+      changed_when: false
+
+    - name: Connect qcow2 via qemu-nbd (read-only)
+      ansible.builtin.command: qemu-nbd --connect=/dev/nbd0 --read-only {{ qcow2 }}
+      become: true
+      changed_when: true
+
+    - name: Wait for partitions to appear
+      ansible.builtin.shell: sleep 2 && ls /dev/nbd0p* 2>/dev/null || echo "(no partitions)"
+      changed_when: false
+      register: _parts
+
+    - name: Show raw partition list
+      ansible.builtin.debug:
+        msg: "Partitions: {{ _parts.stdout_lines }}"
+
+    - name: Run fdisk to show partition table
+      ansible.builtin.shell: fdisk -l /dev/nbd0 2>/dev/null || true
+      become: true
+      register: _fdisk
+      changed_when: false
+
+    - name: Show fdisk / partition table
+      ansible.builtin.debug:
+        msg: "{{ _fdisk.stdout_lines }}"
+
+    - name: Run blkid on all nbd0 partitions
+      ansible.builtin.shell: blkid /dev/nbd0* 2>/dev/null || true
+      become: true
+      register: _blkid
+      changed_when: false
+
+    - name: Show blkid output
+      ansible.builtin.debug:
+        msg: "{{ _blkid.stdout_lines }}"
+
+    - name: Check for LVM PVs
+      ansible.builtin.shell: pvs /dev/nbd0p* 2>/dev/null || echo "no LVM PVs on nbd0"
+      become: true
+      register: _pvs
+      changed_when: false
+
+    - name: Show LVM PV info
+      ansible.builtin.debug:
+        msg: "{{ _pvs.stdout_lines }}"
+
+    - name: Scan for LVs on nbd0 if LVM present
+      ansible.builtin.shell: |
+        pvscan --cache /dev/nbd0p* 2>/dev/null || true
+        vgscan 2>/dev/null || true
+        vgs 2>/dev/null || true
+        lvs 2>/dev/null || true
+      become: true
+      register: _lvm_detail
+      changed_when: false
+
+    - name: Show LVM detail
+      ansible.builtin.debug:
+        msg: "{{ _lvm_detail.stdout_lines }}"
+
+    - name: Mount first XFS/ext4 partition and inspect
+      ansible.builtin.shell: |
+        set -e
+        ROOT=$(blkid /dev/nbd0p* 2>/dev/null | grep -E 'TYPE="(xfs|ext4)"' | cut -d: -f1 | head -1)
+        if [[ -z "$ROOT" ]]; then
+          echo "No XFS/ext4 partition found on nbd0"
+          exit 0
+        fi
+        echo "=== Mounting $ROOT at {{ mnt }} ==="
+        mkdir -p {{ mnt }}
+        mount -o ro "$ROOT" {{ mnt }}
+        echo "=== ls {{ mnt }} ==="
+        ls {{ mnt }}/
+        echo "=== Directory presence ==="
+        for d in dev etc usr proc sys boot; do
+          test -d {{ mnt }}/$d && echo "  /$d: EXISTS" || echo "  /$d: MISSING"
+        done
+        umount {{ mnt }} 2>/dev/null || true
+        rmdir {{ mnt }} 2>/dev/null || true
+      become: true
+      register: _root_inspect
+      changed_when: false
+
+    - name: Show root partition inspection
+      ansible.builtin.debug:
+        msg: "{{ _root_inspect.stdout_lines }}"
+
+    - name: Cleanup — disconnect nbd0 (read-only, safe)
+      ansible.builtin.shell: qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true
+      become: true
+      changed_when: false

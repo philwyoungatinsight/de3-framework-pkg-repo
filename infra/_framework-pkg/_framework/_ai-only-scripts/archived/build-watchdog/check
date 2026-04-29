@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# One-shot build status check — appends one line to the watchdog log in the repo.
+# Run via cron every minute while a build is in progress.
+#
+# SESSION GUARD: writes a heartbeat to a per-repo session file containing
+# "PID timestamp". If another process updated it within the last 90s, this
+# instance exits without writing — prevents two Claude sessions from both
+# acting on the same build state.
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "${GIT_ROOT}/set_env.sh"
+
+SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+MAAS_HOST="10.0.10.11"
+
+WATCHDOG_DIR="${GIT_ROOT}/config/tmp/dynamic/watchdog"
+mkdir -p "${WATCHDOG_DIR}"
+LOG="${WATCHDOG_DIR}/build-watchdog.log"
+SESSION_FILE="${WATCHDOG_DIR}/build-watchdog.session"
+NOW=$(date +%s)
+
+# If another session wrote a heartbeat within the last 90s, yield to it.
+if [[ -f "${SESSION_FILE}" ]]; then
+  read -r OTHER_PID OTHER_TS < "${SESSION_FILE}" 2>/dev/null || true
+  if [[ -n "${OTHER_TS}" && $(( NOW - OTHER_TS )) -lt 90 && "${OTHER_PID}" != "$$" ]]; then
+    # Check the other PID is actually still alive
+    if kill -0 "${OTHER_PID}" 2>/dev/null; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [skipped — session ${OTHER_PID} is active]" >> "${LOG}"
+      exit 0
+    fi
+  fi
+fi
+# Claim the session slot
+echo "$$ ${NOW}" > "${SESSION_FILE}"
+
+MAAS=$(${SSH} ubuntu@"${MAAS_HOST}" \
+  'maas admin machines read 2>/dev/null | python3 -c "
+import json,sys
+machines=json.load(sys.stdin)
+print(\",\".join(f\"{m[\"hostname\"]}={m[\"status_name\"]}\" for m in machines))
+"' 2>/dev/null || echo "maas-unreachable")
+
+if pgrep -f "run --build|run -b( |$)" >/dev/null 2>&1; then
+  RUNNING="RUNNING"
+else
+  RUNNING="STOPPED"
+fi
+
+LATEST_LOG=$(ls -t "${_WAVE_LOGS_DIR}/latest/"*.log 2>/dev/null | head -1 || true)
+if [[ -n "${LATEST_LOG}" ]]; then
+  LAST_ERR=$(grep -E "ERROR|FAILED|fatal" "${LATEST_LOG}" 2>/dev/null | tail -1 \
+    | sed 's/^[[:space:]]*//' | cut -c1-100 || true)
+else
+  LAST_ERR="no-log"
+fi
+
+LOG_LINE="[$(date '+%Y-%m-%d %H:%M:%S')] build=${RUNNING} maas=${MAAS} last_err=${LAST_ERR:-none}"
+echo "${LOG_LINE}" >> "${LOG}"
+
+# ---------------------------------------------------------------------------
+# Write structured YAML watchdog report (atomic via tmp file)
+# ---------------------------------------------------------------------------
+REPORT_DIR="${GIT_ROOT}/config/tmp/dynamic/watchdog-report"
+REPORT_FILE="${REPORT_DIR}/watchdog_report.yaml"
+ARCHIVE_DIR="${REPORT_DIR}/archived"
+mkdir -p "${REPORT_DIR}" "${ARCHIVE_DIR}"
+
+# Archive previous report
+if [[ -f "${REPORT_FILE}" ]]; then
+    mv -f "${REPORT_FILE}" "${ARCHIVE_DIR}/$(date +%Y%m%d%H%M%S)_watchdog_report.yaml" 2>/dev/null || true
+fi
+
+# Determine user_input_needed
+USER_INPUT_NEEDED="false"
+USER_INPUT_MESSAGE=""
+LAST10=$(tail -10 "${LOG}" 2>/dev/null || true)
+
+if [[ "${RUNNING}" == "STOPPED" ]]; then
+    if ! echo "${LAST10}" | grep -qE "build complete|clean complete"; then
+        USER_INPUT_NEEDED="true"
+        USER_INPUT_MESSAGE="Build stopped unexpectedly. Last error: ${LAST_ERR:-none}. Should I investigate and restart?"
+    fi
+fi
+if echo "${LAST10}" | grep -oE 'ERROR[^|]*' | sort | uniq -c | awk '$1>=3{found=1} END{exit !found}' 2>/dev/null; then
+    USER_INPUT_NEEDED="true"
+    USER_INPUT_MESSAGE="Same error repeating 3+ times in build log. Stuck wave? Last error: ${LAST_ERR:-none}"
+fi
+if echo "${LAST10}" | grep -q "maas-unreachable"; then
+    USER_INPUT_NEEDED="true"
+    USER_INPUT_MESSAGE="MaaS server is unreachable. Check 10.0.10.11."
+fi
+
+# One-line assessment
+if [[ "${RUNNING}" == "RUNNING" ]]; then
+    LATEST_WAVE=$(ls -t "${_WAVE_LOGS_DIR}/latest/"*.log 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.log$//' || echo "unknown")
+    ASSESSMENT="Build running — active wave: ${LATEST_WAVE}"
+else
+    ASSESSMENT="Build STOPPED — last error: ${LAST_ERR:-none}"
+fi
+
+ISO_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+TMP_REPORT=$(mktemp "${REPORT_DIR}/.XXXXXX")
+cat > "${TMP_REPORT}" <<YAML
+timestamp: "${ISO_NOW}"
+build_status: "${RUNNING}"
+assessment: "${ASSESSMENT}"
+description: |
+  MaaS machines: ${MAAS}
+  Last build error: ${LAST_ERR:-none}
+  Last log line: $(tail -1 "${LOG}" 2>/dev/null | sed 's/"/\\"/g' || true)
+user_input_needed: ${USER_INPUT_NEEDED}
+user_input_message: "${USER_INPUT_MESSAGE}"
+YAML
+mv -f "${TMP_REPORT}" "${REPORT_FILE}"

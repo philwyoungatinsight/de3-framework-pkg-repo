@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+"""
+wave-mgr — Wave execution engine for the lab stack.
+
+Applies waves, runs tests, and destroys resources.
+Invoked directly or via the top-level 'run' script.
+
+USAGE
+  wave-mgr -a|--apply                       apply all waves + run tests
+  wave-mgr -a|--apply -w <pattern>          apply matching waves + run tests
+  wave-mgr -a|--apply -s|--skip-test        apply all waves, skip tests
+  wave-mgr -w <pattern>                     shorthand for -a -w <pattern>
+  wave-mgr -t|--test                        run test scripts for all waves (no apply)
+  wave-mgr -t|--test -w <pattern>           run test scripts for matching waves
+  wave-mgr -c|--clean                       destroy all wave resources (reverse order, honours _skip_on_wave_run)
+  wave-mgr -c|--clean -w <pattern>          destroy matching waves (reverse order, ignores _skip_on_wave_run)
+  wave-mgr -C|--clean-all                   nuclear cleanup via clean-all (prompts "NUKE", no skipping)
+  wave-mgr -A|--app <name>                  find _application/<name> under any package and run make
+  wave-mgr -u|--unlock-gcs                  delete all stale GCS state locks (.tflock files) and exit
+  wave-mgr -l|--list-waves                  print all waves as a colored table and exit
+  wave-mgr -l|--list-waves -w <pattern>     print only waves matching pattern
+  wave-mgr -l|--list-waves -f json          print as JSON
+  wave-mgr -l|--list-waves -f yaml          print as YAML
+  wave-mgr -L|--list-waves-status           same as -l but adds Duration and Last-Updated columns
+
+  -s|--skip-test can be combined with -a or -w to skip post-apply tests.
+  -i|--ignore-errors can be combined with any mode: log failures and continue
+                     instead of aborting. Exits 1 if any step failed.
+                     If apply fails for a wave, inventory update and test are
+                     skipped for that wave (they depend on apply succeeding).
+  -n|--wave-n N      select wave N by number (1-based); equivalent to
+                     -w <name-of-wave-N>. -n alone implies --apply.
+  -N|--stop-at N     for forward modes (apply/test): process waves 1..N
+                     inclusive. For --clean: process waves N..last in reverse
+                     order (i.e. the usual reverse traversal, stopping at N).
+                     -N alone implies --apply.
+  -M|--start-at N    for forward modes (apply/test): skip waves 1..N-1 and
+                     start from wave N. For --clean: destroy only waves 1..N-1 in
+                     reverse order. Combine with -N/--stop-at to run a range M..N.
+                     -M/--start-at alone implies --apply.
+  --clean and --clean-all never run tests.
+  Wave pattern supports globs: "on_prem.maas.*"
+
+WAVE SELECTION EXAMPLES
+  wave-mgr -n 3                             apply wave 3 only (by number)
+  wave-mgr -n 3 -c                          destroy wave 3 only
+  wave-mgr -N 3                             apply waves 1..3
+  wave-mgr -N 3 -c                          destroy waves 3..last in reverse order
+  wave-mgr -M 4                             apply waves 4..last (skip 1..3)
+  wave-mgr -M 4 -b                          build + apply waves 4..last
+  wave-mgr -M 3 -N 6                        apply waves 3..6
+  wave-mgr -M 3 -c                          destroy waves 1..2 in reverse order
+
+LOGGING
+  All output is ALWAYS logged to a per-run directory:
+    $WAVE_LOGS_DIR/<YYYYMMDD-HHMMSS>/
+        run.log                     — full stdout+stderr for the entire run
+        wave-<name>-apply.log       — terragrunt apply for each wave
+        wave-<name>-destroy.log     — terragrunt destroy (--clean mode)
+        wave-<name>-precheck.log    — pre_ansible_playbook output
+        wave-<name>-test-playbook.log — test_ansible_playbook output
+        wave-<name>-inventory.log   — inventory update output
+    $WAVE_LOGS_DIR/latest/  — symlink to the most recent run directory
+
+  To watch the current run:
+    tail -f $WAVE_LOGS_DIR/latest/run.log
+"""
+
+import argparse
+import datetime
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print('ERROR: pyyaml not installed. Run: pip install pyyaml', file=sys.stderr)
+    sys.exit(1)
+
+_GIT_ROOT = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+sys.path.insert(0, str(_GIT_ROOT / 'infra' / '_framework-pkg' / '_framework' / '_utilities' / 'python'))
+from framework_config import find_framework_config_dirs, load_framework_config
+
+import gcs_status as _gcs_status
+
+
+# ── environment ────────────────────────────────────────────────────────────────
+
+def _source_env() -> dict:
+    """Source set_env.sh and return the resulting environment as a dict."""
+    git_root = subprocess.check_output(
+        ['git', 'rev-parse', '--show-toplevel'], text=True
+    ).strip()
+    raw = subprocess.check_output(
+        ['bash', '-c', f'source {git_root}/set_env.sh && env -0'],
+        text=True,
+    )
+    env = {}
+    for item in raw.split('\0'):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            env[k] = v
+    env['GIT_ROOT'] = git_root
+    return env
+
+
+ENV = _source_env()
+os.environ.update(ENV)
+
+STACK_ROOT         = _GIT_ROOT
+INFRA_DIR          = STACK_ROOT / 'infra'
+FRAMEWORK_PKG_DIR  = INFRA_DIR / '_framework-pkg'
+
+GENERATE_INVENTORY  = FRAMEWORK_PKG_DIR / '_framework/_generate-inventory/run'  # Makefile
+NUKE_ALL            = Path(ENV['_CLEAN_ALL'])
+_VALIDATE_CONFIG_PY = FRAMEWORK_PKG_DIR / '_framework/_utilities/python/validate-config.py'
+_RAMDISK_MGR_RUN    = Path(ENV['_RAMDISK_MGR'])
+
+
+def _run_validate_config() -> None:
+    """Run config validation; abort if violations found. Also trigger ramdisk mounts."""
+    r = subprocess.run(['python3', str(_VALIDATE_CONFIG_PY)], stderr=sys.stderr)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    flag = Path(os.environ.get('_CONFIG_TMP_DIR', '')) / 'validate-config-last-run'
+    if flag.exists() and (time.time() - flag.stat().st_mtime) < 5:
+        subprocess.run(['/bin/bash', str(_RAMDISK_MGR_RUN)], check=False)
+
+
+_run_validate_config()
+
+
+# ── logging ────────────────────────────────────────────────────────────────────
+
+class _Tee:
+    """Write to multiple streams simultaneously."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.streams[0], name)
+
+
+def setup_logging() -> Path:
+    wave_logs_dir = os.environ.get("_WAVE_LOGS_DIR")
+    if not wave_logs_dir:
+        raise RuntimeError("_WAVE_LOGS_DIR is not set — source set_env.sh before running")
+    log_base = Path(wave_logs_dir)
+    run_id = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    log_dir = log_base / run_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    latest = log_base / 'latest'
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    latest.symlink_to(log_dir)
+
+    run_log = log_dir / 'run.log'
+    log_fh = open(run_log, 'w')
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+
+    print('=' * 64)
+    print(f'  run log directory : {log_dir}')
+    print(f'  Full log          : {run_log}')
+    print(f'  Follow output     : tail -f {run_log}')
+    print('=' * 64)
+    print()
+
+    return log_dir
+
+
+# ── subprocess helper ──────────────────────────────────────────────────────────
+
+def _stream(cmd: list, *, extra_env: dict = None, cwd=None, wave_log: Path = None):
+    """
+    Run cmd, streaming output to sys.stdout (tee'd to run.log when logging is
+    active) and optionally also to wave_log.
+    Raises CalledProcessError on non-zero exit.
+    """
+    env = {**ENV, **(extra_env or {})}
+    lf = open(wave_log, 'w') if wave_log else None
+    try:
+        with subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, cwd=str(cwd) if cwd else None,
+            text=True, bufsize=1,
+        ) as proc:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if lf:
+                    lf.write(line)
+                    lf.flush()
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+    finally:
+        if lf:
+            lf.close()
+
+
+# ── config ─────────────────────────────────────────────────────────────────────
+
+def load_all_configs() -> dict:
+    """Load framework config + all per-package configs.
+
+    Framework config (config/framework.yaml) provides:
+      - backend, ssh_config, ansible_inventory, clean_all, pre_apply_unlock
+      - waves_ordering: ordered list of wave names
+
+    Per-package configs (infra/<pkg>/_config/<pkg>.yaml) provide:
+      - wave definitions (with pre/test playbooks, _skip_on_wave_run, etc.)
+      - provider config_params (for lock-key prefix calculation)
+      - package metadata (_provides_capability, _requires_capability, etc.)
+
+    Returns a merged cfg dict with assembled 'waves' list (ordered by framework)
+    plus '_packages' key for package metadata.
+    """
+    # Load framework config from split framework_*.yaml files in _config/.
+    try:
+        cfg = load_framework_config(find_framework_config_dirs(STACK_ROOT))
+    except FileNotFoundError as e:
+        sys.exit(f'ERROR: {e}')
+
+    packages: dict = {}
+    all_wave_defs: dict = {}   # wave_name -> wave dict
+
+    # Load per-package configs — each package's config is named <pkg>.yaml
+    for pkg_dir in sorted(p for p in INFRA_DIR.iterdir() if p.is_dir()):
+        pkg_name = pkg_dir.name
+        pkg_config_file = pkg_dir / '_config' / f'{pkg_name}.yaml'
+        if not pkg_config_file.exists():
+            continue
+        with open(pkg_config_file) as f:
+            pkg_raw = yaml.safe_load(f)
+        if not pkg_raw:
+            continue
+        pkg_cfg = pkg_raw.get(pkg_name, {}) or {}
+
+        # Collect package metadata (underscore-prefixed keys)
+        packages[pkg_name] = {k: v for k, v in pkg_cfg.items() if k.startswith('_')}
+
+        # Collect wave definitions from this package
+        for wave in pkg_cfg.get('waves', []):
+            wave_name = wave.get('name')
+            if wave_name:
+                if wave_name in all_wave_defs:
+                    sys.exit(
+                        f'ERROR: wave {wave_name!r} is defined in both'
+                        f' {all_wave_defs[wave_name]["_pkg"]} and {pkg_name}.'
+                        f' Each wave must be defined in exactly one package.'
+                    )
+                wave = dict(wave)
+                wave['_pkg'] = pkg_name  # internal tracking, stripped before use
+                all_wave_defs[wave_name] = wave
+
+        # Merge providers into cfg (used for pre-apply lock key computation)
+        for prov_name, prov_data in pkg_cfg.get('providers', {}).items():
+            cfg.setdefault('providers', {}).setdefault(prov_name, {})
+            prov_data = prov_data or {}
+            for section, data in prov_data.items():
+                if section == 'config_params':
+                    cfg['providers'][prov_name].setdefault('config_params', {}).update(data or {})
+                else:
+                    cfg['providers'][prov_name][section] = data
+
+    # Discover waves_ordering.yaml using the same search dirs as framework_config.py.
+    # Later dirs have higher priority; iterate in reverse so the first match is the winner.
+    ordering_file = None
+    for config_dir in reversed(find_framework_config_dirs(STACK_ROOT)):
+        candidate = config_dir / 'waves_ordering.yaml'
+        if candidate.exists():
+            ordering_file = candidate
+            break
+    if ordering_file is None:
+        sys.exit('ERROR: waves_ordering.yaml not found in any framework config dir')
+    with open(ordering_file) as f:
+        ordering_raw = yaml.safe_load(f) or {}
+    waves_ordering = ordering_raw.get('waves_ordering', [])
+
+    # Assemble waves in declared order. Each entry is {name: ..., <future attrs>}.
+    assembled = []
+    for entry in waves_ordering:
+        wave_name = entry['name'] if isinstance(entry, dict) else entry
+        if wave_name in all_wave_defs:
+            w = dict(all_wave_defs[wave_name])
+            w.pop('_pkg', None)  # remove internal tracking key
+            assembled.append(w)
+        # Wave in ordering but no package defines it: silently skip
+        # (allows adding waves to ordering before implementing them)
+    cfg['waves'] = assembled
+    cfg['_packages'] = packages
+    return cfg
+
+
+def load_waves() -> list:
+    return load_all_configs().get('waves', [])
+
+
+# ── package validation ─────────────────────────────────────────────────────────
+
+def validate_packages(cfg: dict):
+    """Validate package capability requirements and versions. Exits on failure."""
+    from capability_utils import check_capability_requirements  # noqa: E402
+    errors = check_capability_requirements(
+        packages=cfg.get('_packages', {}),
+        external_caps=cfg.get('external_capabilities', []),
+    )
+    if errors:
+        print('ERROR: package capability requirements not satisfied:', file=sys.stderr)
+        for e in errors:
+            print(f'  {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+def get_gcs_bucket(cfg: dict) -> str:
+    return cfg.get('backend', {}).get('config', {}).get('bucket', '')
+
+
+def get_wave_unit_prefixes(cfg: dict, wave_name: str) -> list:
+    """Return GCS path prefixes for config_params keys whose _wave matches wave_name.
+    A parent-key prefix (e.g. unifi-pkg/_stack/unifi/pwy-homelab/) covers all child units."""
+    prefixes = []
+    for provider_cfg in cfg.get('providers', {}).values():
+        for key, params in provider_cfg.get('config_params', {}).items():
+            if isinstance(params, dict) and params.get('_wave') == wave_name:
+                prefixes.append(key + '/')
+    return prefixes
+
+
+def unlock_all_gcs_locks(bucket: str):
+    """Delete all .tflock files in the GCS bucket. Exits non-zero if gsutil fails."""
+    if not bucket:
+        print('ERROR: no GCS bucket configured', file=sys.stderr)
+        sys.exit(1)
+    result = subprocess.run(
+        ['gsutil', 'ls', '-r', f'gs://{bucket}/'],
+        capture_output=True, text=True, env=ENV,
+    )
+    if result.returncode != 0:
+        print(f'ERROR: gsutil ls failed:\n{result.stderr}', file=sys.stderr)
+        sys.exit(1)
+    locks = [line.strip() for line in result.stdout.splitlines() if line.strip().endswith('.tflock')]
+    if not locks:
+        print('No GCS locks found.')
+        return
+    print(f'Removing {len(locks)} lock(s):')
+    for lock in locks:
+        print(f'  {lock}')
+    subprocess.run(['gsutil', '-m', 'rm'] + locks, env=ENV, check=True)
+    print('Done.')
+
+
+def unlock_wave_locks(wave_name: str, bucket: str, prefixes: list):
+    """Delete stale GCS lock files for units in the given wave. Best-effort (non-fatal)."""
+    if not bucket or not prefixes:
+        return
+    try:
+        result = subprocess.run(
+            ['gsutil', 'ls', '-r', f'gs://{bucket}/'],
+            capture_output=True, text=True, env=ENV,
+        )
+        if result.returncode != 0:
+            return
+        base = f'gs://{bucket}/'
+        to_delete = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().endswith('.tflock')
+            and any(line.strip()[len(base):].startswith(p) for p in prefixes)
+        ]
+        if to_delete:
+            print(f'\n--- [{wave_name}] unlock: removing {len(to_delete)} stale lock(s) ---')
+            subprocess.run(['gsutil', '-m', 'rm'] + to_delete, env=ENV, check=False)
+    except Exception:
+        pass  # never block apply
+
+
+# ── wave actions ───────────────────────────────────────────────────────────────
+
+def run_tg(action: str, wave: str, log_dir: Path):
+    log = log_dir / f'wave-{wave}-{action}.log'
+    print(f'\n--- [{wave}] terragrunt {action} ---')
+    _gcs_status.write_wave_status(wave, action, 'running')
+    try:
+        _stream(
+            ['terragrunt', 'run', '--all', action, '--non-interactive'],
+            extra_env={'TG_WAVE': wave, '_INVENTORY_WAVE': wave},
+            cwd=INFRA_DIR,
+            wave_log=log,
+        )
+    except Exception:
+        _gcs_status.write_wave_status(wave, action, 'fail')
+        raise
+    _gcs_status.write_wave_status(wave, action, 'ok')
+    print(f'--- [{wave}] {action} done ---')
+
+
+def run_ansible_playbook(playbook: str, wave: str, phase: str, log_dir: Path):
+    # Search for playbook in all packages' _wave_scripts/ directories
+    path = None
+    for pkg_dir in sorted(INFRA_DIR.iterdir()):
+        candidate = pkg_dir / '_wave_scripts' / 'test-ansible-playbooks' / playbook / 'run'
+        if candidate.is_file():
+            path = candidate
+            break
+    if path is None:
+        print(f'ERROR: playbook run not found for {playbook!r} under any infra/<pkg>/_wave_scripts/', file=sys.stderr)
+        sys.exit(1)
+    log = log_dir / f'wave-{wave}-{phase}.log'
+    print(f'\n--- [{wave}] {phase}: {playbook} ---')
+    _gcs_status.write_wave_status(wave, phase, 'running')
+    try:
+        _stream([str(path)], wave_log=log)
+    except Exception:
+        _gcs_status.write_wave_status(wave, phase, 'fail')
+        raise
+    _gcs_status.write_wave_status(wave, phase, 'ok')
+    print(f'--- [{wave}] {phase} done ---')
+
+
+def update_inventory(wave: str, log_dir: Path, *, partial: bool = False):
+    if not GENERATE_INVENTORY.is_file():
+        print(f'WARNING: generate-ansible-inventory not found — skipping')
+        return
+    # Partial run: pass the current wave name so SSH failures on hosts belonging
+    # to other waves are downgraded to warnings (host stays in inventory).
+    # Full run: no --wave filter — all hosts are checked strictly.
+    extra = {'_INVENTORY_WAVE': wave} if partial else {}
+    log = log_dir / f'wave-{wave}-inventory.log'
+    print(f'\n--- [{wave}] update-inventory ({"partial" if partial else "full"}) ---')
+    _stream([str(GENERATE_INVENTORY), '--build'], extra_env=extra, wave_log=log)
+    print(f'--- [{wave}] update-inventory done ---')
+
+
+# ── list-waves ─────────────────────────────────────────────────────────────────
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as a compact human-readable duration.
+
+    Examples: "3h-22m-07s" / "22m-07s" / "7s"
+    Leading zero components are suppressed; the last component is always shown.
+    """
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f'{h}h-{m:02d}m-{sec:02d}s'
+    if m:
+        return f'{m}m-{sec:02d}s'
+    return f'{sec}s'
+
+
+def _scan_wave_statuses() -> dict:
+    """Scan $_WAVE_LOGS_DIR and return per-wave status, duration, and last-updated.
+
+    Walks log directories newest-first; for each wave name, resolves each log
+    type (main apply/destroy, precheck, test-playbook) independently from the
+    newest directory that contains that log file. Mirrors the logic in the GUI's
+    refresh_wave_log_statuses(). Returns:
+      { wave_name: { 'status': str, 'pre_status': str, 'test_status': str,
+                     'duration': str, 'last_updated': str } }
+    Status values: "ok" | "fail" | "running" | "none"
+    """
+    import re
+    wave_logs_dir = os.environ.get("_WAVE_LOGS_DIR")
+    if not wave_logs_dir:
+        raise RuntimeError("_WAVE_LOGS_DIR is not set — source set_env.sh before running")
+    log_base = Path(wave_logs_dir)
+    if not log_base.exists():
+        return {}
+    ts_pattern = re.compile(r'^\d{8}-\d{6}$')
+    dirs = sorted(
+        [d for d in log_base.iterdir()
+         if d.is_dir() and not d.is_symlink() and ts_pattern.match(d.name)],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+
+    # Track which wave names have been resolved for each log type
+    main_found: set = set()
+    pre_found:  set = set()
+    test_found: set = set()
+    statuses: dict = {}
+    now = datetime.datetime.now()
+
+    _RUNNING_THRESHOLD_SECS = 300
+
+    def _wave_status(run_content, wave_name, action, run_log_mtime=None):
+        done_marker = f'--- [{wave_name}] {action} done ---'
+        fail_marker = f'[{wave_name}] {action} failed'
+        if done_marker in run_content:
+            return 'ok'
+        if fail_marker in run_content or 'ERROR: command failed' in run_content:
+            return 'fail'
+        if run_log_mtime is not None:
+            age = (now - datetime.datetime.fromtimestamp(run_log_mtime)).total_seconds()
+            if age < _RUNNING_THRESHOLD_SECS:
+                return 'running'
+        return 'fail'
+
+    for d in dirs:
+        try:
+            start_dt = datetime.datetime.strptime(d.name, '%Y%m%d-%H%M%S')
+        except ValueError:
+            start_dt = None
+
+        run_log = d / 'run.log'
+        run_content = run_log.read_text(errors='replace') if run_log.exists() else ''
+        try:
+            run_log_mtime = run_log.stat().st_mtime if run_log.exists() else None
+        except OSError:
+            run_log_mtime = None
+
+        for log_file in sorted(d.iterdir()):
+            fname = log_file.name
+
+            # ── main: apply / destroy ──────────────────────────────────────
+            mm = re.match(r'^wave-(.+)-(apply|destroy)\.log$', fname)
+            if mm:
+                wave_name = mm.group(1)
+                action    = mm.group(2)
+                if wave_name not in main_found:
+                    main_found.add(wave_name)
+                    try:
+                        end_dt = datetime.datetime.fromtimestamp(log_file.stat().st_mtime)
+                    except OSError:
+                        end_dt = None
+                    entry = statuses.setdefault(wave_name, {})
+                    entry['status'] = _wave_status(run_content, wave_name, action, run_log_mtime)
+                    entry['duration'] = (
+                        _fmt_duration((end_dt - start_dt).total_seconds())
+                        if start_dt and end_dt else ''
+                    )
+                    entry['last_updated'] = (
+                        _fmt_duration((now - end_dt).total_seconds())
+                        if end_dt else ''
+                    )
+                continue
+
+            # ── precheck ──────────────────────────────────────────────────
+            mp = re.match(r'^wave-(.+)-precheck\.log$', fname)
+            if mp:
+                wave_name = mp.group(1)
+                if wave_name not in pre_found:
+                    pre_found.add(wave_name)
+                    entry = statuses.setdefault(wave_name, {})
+                    entry['pre_status'] = _wave_status(run_content, wave_name, 'precheck', run_log_mtime)
+                continue
+
+            # ── test-playbook ──────────────────────────────────────────────
+            mt = re.match(r'^wave-(.+)-test-playbook\.log$', fname)
+            if mt:
+                wave_name = mt.group(1)
+                if wave_name not in test_found:
+                    test_found.add(wave_name)
+                    entry = statuses.setdefault(wave_name, {})
+                    entry['test_status'] = _wave_status(run_content, wave_name, 'test-playbook', run_log_mtime)
+
+    return statuses
+
+
+def list_waves(all_waves: list, wave_filter: str, fmt: str, statuses: dict = None):
+    waves = [
+        w for w in all_waves
+        if not wave_filter or fnmatch.fnmatch(w['name'], wave_filter)
+    ]
+
+    if fmt == 'json':
+        if statuses:
+            for w in waves:
+                s = statuses.get(w.get('name', ''), {})
+                if s:
+                    w = dict(w, **s)
+        print(json.dumps(waves, indent=2))
+        return
+
+    if fmt == 'yaml':
+        if statuses:
+            waves = [dict(w, **statuses.get(w.get('name', ''), {})) for w in waves]
+        print(yaml.dump(waves, default_flow_style=False), end='')
+        return
+
+    # Colored table
+    use_color = sys.__stdout__.isatty() and not os.environ.get('NO_COLOR')
+    BOLD    = '\033[1m'  if use_color else ''
+    RESET   = '\033[0m'  if use_color else ''
+    CYAN    = '\033[36m' if use_color else ''
+    GREEN   = '\033[32m' if use_color else ''
+    YELLOW  = '\033[33m' if use_color else ''
+    RED     = '\033[31m' if use_color else ''
+    DIM     = '\033[2m'  if use_color else ''
+    MAGENTA = '\033[35m' if use_color else ''
+
+    def cell(text, width, color=''):
+        padded = text.ljust(width)
+        return f'{color}{padded}{RESET}' if color else padded
+
+    def rcell(text, width, color=''):
+        padded = text.rjust(width)
+        return f'{color}{padded}{RESET}' if color else padded
+
+    # Status symbol + color for "ok"/"fail"/"running"/"none"/""
+    _STATUS_ICON = {
+        'ok':      ('✓', GREEN),
+        'fail':    ('✗', RED),
+        'running': ('⟳', YELLOW),
+        'none':    ('·', DIM),
+        '':        ('·', DIM),
+    }
+
+    def status_icon(s):
+        sym, col = _STATUS_ICON.get(s, ('?', DIM))
+        return f'{col}{sym}{RESET}' if col else sym
+
+    rows = [
+        (
+            w.get('name', ''),
+            w.get('pre_ansible_playbook', ''),
+            w.get('test_ansible_playbook', ''),
+            w.get('test_action', ''),
+            '✓' if w.get('update_inventory') else '',
+        )
+        for w in waves
+    ]
+
+    # "P·R·T" status cell: 5 visible chars ("P R T" with spaces)
+    STATUS_HDR = 'P R T'
+    STATUS_W   = len(STATUS_HDR)  # 5
+
+    if statuses:
+        st_rows = [
+            (
+                statuses.get(w.get('name', ''), {}).get('pre_status',  ''),
+                statuses.get(w.get('name', ''), {}).get('status',      ''),
+                statuses.get(w.get('name', ''), {}).get('test_status', ''),
+                statuses.get(w.get('name', ''), {}).get('duration',    ''),
+                statuses.get(w.get('name', ''), {}).get('last_updated',''),
+            )
+            for w in waves
+        ]
+        HEADERS = ('#', 'Wave', 'Pre-Run Ansible Playbook',
+                   'Test Ansible Playbook', 'Test Action', 'Inv',
+                   STATUS_HDR, 'Duration', 'Last Updated')
+        W = [
+            max(len(HEADERS[0]), len(str(len(rows)))),
+            max(len(HEADERS[1]), max((len(r[0]) for r in rows), default=0)),
+            max(len(HEADERS[2]), max((len(r[1]) for r in rows), default=0)),
+            max(len(HEADERS[3]), max((len(r[2]) for r in rows), default=0)),
+            max(len(HEADERS[4]), max((len(r[3]) for r in rows), default=0)),
+            max(len(HEADERS[5]), max((len(r[4]) for r in rows), default=0)),
+            STATUS_W,
+            max(len(HEADERS[7]), max((len(s[3]) for s in st_rows), default=0)),
+            max(len(HEADERS[8]), max((len(s[4]) for s in st_rows), default=0)),
+        ]
+    else:
+        st_rows = None
+        HEADERS = ('#', 'Wave', 'Pre-Run Ansible Playbook',
+                   'Test Ansible Playbook', 'Test Action', 'Inv')
+        W = [
+            max(len(HEADERS[0]), len(str(len(rows)))),
+            max(len(HEADERS[1]), max((len(r[0]) for r in rows), default=0)),
+            max(len(HEADERS[2]), max((len(r[1]) for r in rows), default=0)),
+            max(len(HEADERS[3]), max((len(r[2]) for r in rows), default=0)),
+            max(len(HEADERS[4]), max((len(r[3]) for r in rows), default=0)),
+            max(len(HEADERS[5]), max((len(r[4]) for r in rows), default=0)),
+        ]
+
+    divider = '┼'.join('─' * (w + 2) for w in W)
+    header = ' │ '.join(
+        (HEADERS[i].rjust(W[i]) if i == 0 else HEADERS[i].ljust(W[i]))
+        for i in range(len(HEADERS))
+    )
+    print(f'{BOLD} {header} {RESET}')
+    print(divider)
+
+    for i, (name, pre_pb, test_pb, test_a, inv) in enumerate(rows, 1):
+        cols = [
+            str(i).rjust(W[0]),
+            cell(name,    W[1], CYAN),
+            cell(pre_pb,  W[2], GREEN  if pre_pb  else DIM),
+            cell(test_pb, W[3], GREEN  if test_pb else DIM),
+            cell(test_a,  W[4], YELLOW if test_a  else DIM),
+            cell(inv,     W[5], GREEN  if inv     else DIM),
+        ]
+        if st_rows:
+            pre_s, run_s, tst_s, dur, upd = st_rows[i - 1]
+            # "P R T" — three icons with a space between each; always 5 visible chars
+            status_cell = f'{status_icon(pre_s)} {status_icon(run_s)} {status_icon(tst_s)}'
+            cols.append(status_cell)
+            cols.append(rcell(dur, W[7], MAGENTA if dur else DIM))
+            cols.append(rcell(upd, W[8], DIM))
+        print(f' {cols[0]} │ {" │ ".join(cols[1:])} ')
+
+    if wave_filter:
+        print(f'\n{DIM}filter: {wave_filter}  ({len(waves)} of {len(all_waves)} waves){RESET}')
+    else:
+        print(f'\n{DIM}{len(waves)} wave{"s" if len(waves) != 1 else ""}{RESET}')
+
+
+# ── arg parsing ────────────────────────────────────────────────────────────────
+
+def find_application(name: str) -> Path:
+    """Search all _application/<name> directories under infra packages.
+
+    Errors and exits if:
+      - no match is found
+      - more than one match is found (name collision across packages)
+    Returns the matching application directory path on success.
+    """
+    matches = [
+        d
+        for pkg_dir in INFRA_DIR.iterdir()
+        if pkg_dir.is_dir()
+        for d in [pkg_dir / '_application' / name]
+        if d.is_dir()
+    ]
+    if len(matches) == 0:
+        print(f'ERROR: no _application/{name!r} found under any package in {INFRA_DIR}', file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        paths = '\n  '.join(str(m) for m in matches)
+        print(
+            f'ERROR: ambiguous app name {name!r} — found in multiple packages:\n  {paths}',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return matches[0]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog='wave-mgr',
+        description='Wave execution engine — applies waves, runs tests, destroys resources.',
+        add_help=True,
+    )
+    p.add_argument('-a', '--apply',           action='store_true', help='apply all waves + run tests')
+    p.add_argument('-t', '--test',            action='store_true', help='run tests for all waves (no apply)')
+    p.add_argument('-c', '--clean',           action='store_true', help='destroy all wave resources (reverse order)')
+    p.add_argument('-C', '--clean-all',       action='store_true', dest='clean_all', help='nuclear cleanup via clean-all')
+    p.add_argument('-u', '--unlock-gcs',      action='store_true', dest='unlock_gcs',     help='delete all stale GCS state locks (.tflock files) and exit')
+    p.add_argument('-A', '--app',             metavar='NAME',      dest='app',        help='find _application/<NAME> under any package and run make')
+    p.add_argument('-l', '--list-waves',      action='store_true', dest='list_waves', help='print waves and exit')
+    p.add_argument('-L', '--list-waves-status', action='store_true', dest='list_waves_status', help='like -l but adds Duration and Last-Updated columns from run logs')
+    p.add_argument('-w', '--wave',           metavar='PATTERN',   help='wave name glob filter (-w alone implies --apply)')
+    p.add_argument('-n', '--wave-n',         type=int, metavar='N', dest='wave_n',
+                   help='select wave N by number (1-based); equivalent to -w <name>. -n alone implies --apply')
+    p.add_argument('-N', '--stop-at',        type=int, metavar='N', dest='stop_at',
+                   help='process waves 1..N (forward) or N..last (clean). -N alone implies --apply')
+    p.add_argument('-M', '--start-at',      type=int, metavar='N', dest='start_at',
+                   help='skip waves 1..N-1 and start from wave N (forward). For clean: destroy only 1..N-1. -M/--start-at alone implies --apply')
+    p.add_argument('-s', '--skip-test',      action='store_true', dest='skip_test',     help='skip post-apply tests')
+    p.add_argument('-i', '--ignore-errors',  action='store_true', dest='ignore_errors', help='continue past failures; exit 1 at end if any step failed')
+    p.add_argument('-f', '--format',         choices=['table', 'json', 'yaml'], default='table', help='output format for --list-waves')
+
+    args = p.parse_args()
+
+    # Mutual-exclusion checks
+    if args.wave_n is not None and args.wave is not None:
+        p.error('-n/--wave-n and -w/--wave cannot be combined')
+    if args.wave_n is not None and args.stop_at is not None:
+        p.error('-n/--wave-n and -N/--stop-at cannot be combined')
+    if args.stop_at is not None and args.wave is not None:
+        p.error('-N/--stop-at and -w/--wave cannot be combined')
+    if args.start_at is not None and args.wave is not None:
+        p.error('--start-at and -w/--wave cannot be combined')
+    if args.start_at is not None and args.wave_n is not None:
+        p.error('--start-at and -n/--wave-n cannot be combined')
+
+    # -w / -n / -N / --start-at alone are shorthand for --apply
+    mode_flags = [args.apply, args.test, args.clean,
+                  args.clean_all, args.unlock_gcs, args.list_waves, args.list_waves_status]
+    implied = args.wave or args.wave_n is not None or args.stop_at is not None or args.start_at is not None
+    if args.app is not None:
+        if any(mode_flags) or implied:
+            p.error('-A/--app cannot be combined with other modes')
+    elif implied and not any(mode_flags):
+        args.apply = True
+    elif not any(mode_flags) and not implied:
+        p.print_help()
+        sys.exit(0)
+
+    return args
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def _warn(msg: str):
+    print(f'\nWARN: {msg}', file=sys.stderr)
+
+
+def main():
+    args = parse_args()
+
+    # ── app (no logging, run make in _application/<name>) ──
+    # Handled before load_all_configs() because apps need no wave config.
+    if args.app is not None:
+        app_dir = find_application(args.app)
+        print(f'Running make in {app_dir}')
+        result = subprocess.run(['make'], cwd=str(app_dir), env=ENV)
+        sys.exit(result.returncode)
+
+    cfg = load_all_configs()
+    all_waves = cfg.get('waves', [])
+    ignore = args.ignore_errors
+    failures = []
+    pre_apply_unlock = cfg.get('pre_apply_unlock', True)
+    gcs_bucket = get_gcs_bucket(cfg) if cfg.get('backend', {}).get('type') == 'gcs' else ''
+
+    # ── list-waves (no logging) ──
+    if args.list_waves or args.list_waves_status:
+        display = all_waves
+        if args.stop_at is not None:
+            n = args.stop_at
+            if n < 1 or n > len(all_waves):
+                print(f'ERROR: -N {n} out of range (1..{len(all_waves)})', file=sys.stderr)
+                sys.exit(1)
+            display = all_waves[:n]
+        statuses = _scan_wave_statuses() if args.list_waves_status else None
+        list_waves(display, args.wave or '', args.format, statuses)
+        return
+
+    # ── unlock-gcs only (no logging) ──
+    if args.unlock_gcs:
+        unlock_all_gcs_locks(get_gcs_bucket(cfg))
+        return
+
+    # Wave ordering and package validation only matter when applying waves.
+    validate_packages(cfg)
+
+    # ── Resolve -n (wave by number) → args.wave ──
+    if args.wave_n is not None:
+        n = args.wave_n
+        if n < 1 or n > len(all_waves):
+            print(f'ERROR: -n {n} out of range (1..{len(all_waves)})', file=sys.stderr)
+            sys.exit(1)
+        args.wave = all_waves[n - 1]['name']
+
+    # ── clean-all (no logging, interactive) ──
+    # Run directly with inherited stdout/stderr so confirm_destructive() can
+    # print the prompt to the terminal and read the user's "NUKE" reply.
+    # Do NOT use _stream() here — piping stdout breaks the interactive prompt.
+    if args.clean_all:
+        if not NUKE_ALL.is_file():
+            print(f'ERROR: clean-all not found: {NUKE_ALL}', file=sys.stderr)
+            sys.exit(1)
+        result = subprocess.run([str(NUKE_ALL)], env=ENV)
+        sys.exit(result.returncode)
+        return
+
+    # ── all other modes: set up logging first ──
+    log_dir = setup_logging()
+
+    # ── filter + order waves ──
+    waves = all_waves
+    if args.wave:
+        waves = [w for w in waves if fnmatch.fnmatch(w['name'], args.wave)]
+    if args.start_at is not None:
+        n = args.start_at
+        if n < 1 or n > len(all_waves):
+            print(f'ERROR: --start-at {n} out of range (1..{len(all_waves)})', file=sys.stderr)
+            sys.exit(1)
+        # Forward: waves N..last.  Clean: waves 1..N-1 (reverse applied below).
+        waves = all_waves[n - 1:] if not args.clean else all_waves[:n - 1]
+    if args.stop_at is not None:
+        n = args.stop_at
+        if n < 1 or n > len(all_waves):
+            print(f'ERROR: -N {n} out of range (1..{len(all_waves)})', file=sys.stderr)
+            sys.exit(1)
+        # Forward: waves 1..N.  Clean: waves N..last (reverse applied below).
+        # When combined with --start-at, waves is already filtered to start_at..last;
+        # cap it to start_at..(N) by re-slicing from all_waves.
+        if args.start_at is not None:
+            waves = all_waves[args.start_at - 1:n]
+        else:
+            waves = all_waves[:n] if not args.clean else all_waves[n - 1:]
+    # Honour _skip_on_wave_run unless the user targeted a specific wave with -w.
+    # Applies to both build and clean — these waves are never run by the default runner.
+    if not args.wave:
+        waves = [w for w in waves if not w.get('_skip_on_wave_run')]
+    if args.clean:
+        waves = list(reversed(waves))
+
+    partial_run = len(waves) < len(all_waves)
+
+    print('=== lab-stack wave runner ===\n')
+
+    for w in waves:
+        name        = w['name']
+        pre_pb      = w.get('pre_ansible_playbook', '')
+        test_pb     = w.get('test_ansible_playbook', '')
+        test_action = w.get('test_action', '')
+        update_inv  = w.get('update_inventory', False)
+        max_retries        = w.get('max_retries', 0)
+        retry_delay        = w.get('retry_delay_seconds', 0)
+
+        print(f'\n{"═" * 64}')
+        print(f'  Wave: {name}')
+        print(f'{"═" * 64}')
+
+        # ── clean mode ──
+        if args.clean:
+            try:
+                run_tg('destroy', name, log_dir)
+            except subprocess.CalledProcessError as e:
+                if not ignore:
+                    raise
+                _warn(f'[{name}] destroy failed (exit {e.returncode}) — continuing')
+                failures.append(f'{name}:destroy')
+            continue
+
+        # ── test-only mode ──
+        if args.test:
+            try:
+                if test_pb:
+                    run_ansible_playbook(test_pb, name, 'test-playbook', log_dir)
+                elif test_action == 'reapply':
+                    print(f'\n--- [{name}] test: reapply (idempotency check) ---')
+                    run_tg('apply', name, log_dir)
+                else:
+                    print('  (no test configured for this wave)')
+            except subprocess.CalledProcessError as e:
+                if not ignore:
+                    raise
+                _warn(f'[{name}] test failed (exit {e.returncode}) — continuing')
+                failures.append(f'{name}:test')
+            continue
+
+        # ── apply + test with retry ──
+        # max_retries: number of additional attempts after the first.
+        # The precheck, apply, and test all run inside the retry loop.
+        # If the precheck fails and retries remain, the whole wave retries
+        # (e.g. waiting for freshly-deployed machines to become SSHable before
+        # proxmox.install). If the test fails and retries remain, the test
+        # playbook should reset machine state so the retry apply re-provisions.
+        wave_attempt  = 0
+        wave_pass     = False
+        wave_failures = []
+
+        while wave_attempt <= max_retries:
+            if wave_attempt > 0:
+                if retry_delay > 0:
+                    print(f'\n--- [{name}] retry {wave_attempt}/{max_retries} (waiting {retry_delay}s) ---')
+                    time.sleep(retry_delay)
+                else:
+                    print(f'\n--- [{name}] retry {wave_attempt}/{max_retries} ---')
+
+            # ── pre-apply: clear stale GCS locks for this wave's units ──
+            if pre_apply_unlock and gcs_bucket:
+                unlock_wave_locks(name, gcs_bucket, get_wave_unit_prefixes(cfg, name))
+
+            # ── pre-run hook ──
+            if pre_pb:
+                try:
+                    run_ansible_playbook(pre_pb, name, 'precheck', log_dir)
+                except subprocess.CalledProcessError as e:
+                    if wave_attempt < max_retries:
+                        _warn(f'[{name}] precheck failed (attempt {wave_attempt + 1}/{max_retries + 1}) — will retry')
+                        wave_attempt += 1
+                        continue
+                    elif not ignore:
+                        raise
+                    else:
+                        _warn(f'[{name}] precheck failed (exit {e.returncode}) — continuing')
+                        wave_failures.append(f'{name}:precheck')
+
+            # ── apply ──
+            apply_ok = True
+            try:
+                run_tg('apply', name, log_dir)
+            except subprocess.CalledProcessError as e:
+                if not ignore and wave_attempt >= max_retries:
+                    raise
+                _warn(f'[{name}] apply failed (exit {e.returncode}) — skipping inventory/test for this wave')
+                wave_failures.append(f'{name}:apply')
+                apply_ok = False
+
+            # ── inventory update (skip if apply failed) ──
+            if update_inv and apply_ok:
+                try:
+                    update_inventory(name, log_dir, partial=partial_run)
+                except subprocess.CalledProcessError as e:
+                    if not ignore:
+                        raise
+                    _warn(f'[{name}] inventory update failed (exit {e.returncode}) — continuing')
+                    wave_failures.append(f'{name}:inventory')
+
+            # ── test phase (skip if apply failed) ──
+            test_ok = True
+            if not args.skip_test and apply_ok:
+                try:
+                    if test_pb:
+                        run_ansible_playbook(test_pb, name, 'test-playbook', log_dir)
+                    elif test_action == 'reapply':
+                        print(f'\n--- [{name}] test: reapply (idempotency check) ---')
+                        run_tg('apply', name, log_dir)
+                except subprocess.CalledProcessError as e:
+                    test_ok = False
+                    if wave_attempt < max_retries:
+                        _warn(f'[{name}] test failed (attempt {wave_attempt + 1}/{max_retries + 1}) — will retry wave')
+                    elif not ignore:
+                        raise
+                    else:
+                        _warn(f'[{name}] test failed (exit {e.returncode}) — continuing')
+                        wave_failures.append(f'{name}:test')
+
+            if apply_ok and test_ok:
+                wave_pass = True
+                break
+
+            wave_attempt += 1
+
+        if not wave_pass:
+            failures.extend(wave_failures)
+
+    if failures:
+        print(f'\n=== lab-stack complete — {len(failures)} failure(s) ===')
+        for f in failures:
+            print(f'  FAIL: {f}', file=sys.stderr)
+        sys.exit(1)
+
+    print('\n=== lab-stack complete ===')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        print(f'\nERROR: command failed (exit {e.returncode})', file=sys.stderr)
+        sys.exit(e.returncode)
+    except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
+        sys.exit(130)

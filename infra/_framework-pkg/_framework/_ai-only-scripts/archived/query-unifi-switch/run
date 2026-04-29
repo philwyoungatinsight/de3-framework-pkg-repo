@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Query live UniFi switch port data (link speed + MAC table per port).
+# Usage: ./run [SWITCH_FILTER]
+#   SWITCH_FILTER: optional substring match on switch name (e.g. "Flex", "Pro")
+#
+# Example:
+#   ./run              # show all switches
+#   SWITCH_FILTER=Flex ./run   # show USW-Flex only
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=/dev/null
+. "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+VENV_BASE="$SCRIPT_DIR"
+_activate_ansible_locally "$VENV_BASE"
+
+export SWITCH_FILTER="${1:-${SWITCH_FILTER:-}}"
+
+ansible-playbook \
+  -i "$GIT_ROOT/infra/_framework-pkg/_framework/_generate-inventory/inventory/localhost.yaml" \
+  "$SCRIPT_DIR/playbook.yaml"

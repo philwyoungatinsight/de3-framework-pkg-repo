@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Lab Stack entry point — orchestrates bootstrap, package management, and waves.
+
+Bootstrap is automatic: if infra/_framework-pkg is missing, --bootstrap runs first.
+
+USAGE
+  ./run --bootstrap                       ensure infra/_framework-pkg symlink is in place (idempotent)
+  ./run -b|--build [wave-mgr opts]        bootstrap + sync-packages + setup-packages +
+                                          ensure-backend + wave-mgr --apply [wave-mgr opts]
+  ./run -Y|--sync-packages               clone/link external package repos (idempotent)
+  ./run -S|--setup-packages              run per-package setup scripts (idempotent)
+  ./run -P|--seed-packages               login + seed + test all cloud packages
+  ./run -e|--ensure-backend              bootstrap backend if not present
+
+  All other flags are passed through to wave-mgr:
+  ./run -a|--apply [wave-mgr opts]
+  ./run -c|--clean [wave-mgr opts]
+  ./run -C|--clean-all
+  ./run -t|--test [wave-mgr opts]
+  ./run -l|--list-waves [wave-mgr opts]
+  ./run -L|--list-waves-status
+  ./run -u|--unlock-gcs
+  ./run -w PATTERN / -n N / -N N / -M N
+  ./run -A|--app NAME
+  ./run -s / -i / -f FORMAT
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print('ERROR: pyyaml not installed. Run: pip install pyyaml', file=sys.stderr)
+    sys.exit(1)
+
+_GIT_ROOT = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+
+# ── bootstrap ──────────────────────────────────────────────────────────────────
+
+_DE3_RUNNER_URL = 'https://github.com/philwyoungatinsight/de3-runner.git'
+_DE3_RUNNER_REF = 'main'
+
+
+def _bootstrap():
+    """Clone/update de3-runner and create the infra/_framework-pkg symlink."""
+    clone_dir = _GIT_ROOT / '_ext_packages' / 'de3-runner' / _DE3_RUNNER_REF
+    link      = _GIT_ROOT / 'infra' / '_framework-pkg'
+    clone_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not clone_dir.exists():
+        print('==> Bootstrapping _framework-pkg from de3-runner...')
+        subprocess.run(
+            ['git', 'clone', '--branch', _DE3_RUNNER_REF, _DE3_RUNNER_URL, str(clone_dir)],
+            check=True,
+        )
+    else:
+        subprocess.run(['git', '-C', str(clone_dir), 'pull', '--ff-only'], check=False)
+    # Relative symlink: infra/_framework-pkg → ../../_ext_packages/de3-runner/main/infra/_framework-pkg
+    target = Path('../..') / '_ext_packages' / 'de3-runner' / _DE3_RUNNER_REF / 'infra' / '_framework-pkg'
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        raise RuntimeError(f'{link} exists and is not a symlink — cannot bootstrap')
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    print('==> Bootstrap complete.')
+
+
+# Auto-bootstrap before sourcing set_env.sh (which requires _framework-pkg).
+_FRAMEWORK_PKG_LINK = _GIT_ROOT / 'infra' / '_framework-pkg'
+if not _FRAMEWORK_PKG_LINK.exists():
+    _bootstrap()
+
+# ── environment ────────────────────────────────────────────────────────────────
+
+def _source_env() -> dict:
+    """Source set_env.sh and return the resulting environment as a dict."""
+    git_root = subprocess.check_output(
+        ['git', 'rev-parse', '--show-toplevel'], text=True
+    ).strip()
+    raw = subprocess.check_output(
+        ['bash', '-c', f'source {git_root}/set_env.sh && env -0'],
+        text=True,
+    )
+    env = {}
+    for item in raw.split('\0'):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            env[k] = v
+    env['GIT_ROOT'] = git_root
+    return env
+
+
+ENV = _source_env()
+os.environ.update(ENV)
+
+STACK_ROOT        = _GIT_ROOT
+INFRA_DIR         = STACK_ROOT / 'infra'
+FRAMEWORK_PKG_DIR = INFRA_DIR / '_framework-pkg'
+
+INIT_SH             = FRAMEWORK_PKG_DIR / '_framework/_utilities/bash/init.sh'
+PKG_MGR             = Path(ENV['_PKG_MGR'])
+_VALIDATE_CONFIG_PY = FRAMEWORK_PKG_DIR / '_framework/_utilities/python/validate-config.py'
+_RAMDISK_MGR_BIN    = Path(ENV['_RAMDISK_MGR'])
+WAVE_MGR            = Path(ENV['_WAVE_MGR'])
+
+
+def _run_validate_config() -> None:
+    """Run config validation; abort if violations found. Also trigger ramdisk mounts."""
+    r = subprocess.run(['python3', str(_VALIDATE_CONFIG_PY)], stderr=sys.stderr)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    flag = Path(os.environ.get('_CONFIG_TMP_DIR', '')) / 'validate-config-last-run'
+    if flag.exists() and (time.time() - flag.stat().st_mtime) < 5:
+        subprocess.run(['/bin/bash', str(_RAMDISK_MGR_BIN)], check=False)
+
+
+_run_validate_config()
+
+
+# ── subprocess helper ──────────────────────────────────────────────────────────
+
+def _stream(cmd: list, *, extra_env: dict = None, cwd=None):
+    """Run cmd, streaming output. Raises CalledProcessError on non-zero exit."""
+    env = {**ENV, **(extra_env or {})}
+    with subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, cwd=str(cwd) if cwd else None,
+        text=True, bufsize=1,
+    ) as proc:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
+# ── package management ─────────────────────────────────────────────────────────
+
+def sync_packages():
+    """Clone/link external package repos so infra/<pkg> symlinks resolve."""
+    if not PKG_MGR.is_file():
+        print(f'ERROR: pkg-mgr not found: {PKG_MGR}', file=sys.stderr)
+        sys.exit(1)
+    print('\n=== package sync ===')
+    _stream([str(PKG_MGR), '--sync'])
+    print('\n=== package sync done ===')
+
+
+def setup_packages():
+    """Run per-package setup scripts idempotently.
+
+    Discovers infra/*/_setup/run on the filesystem.
+    Runs _framework-pkg/_setup/run first (if present), then all others alphabetically.
+    Packages without a setup script are silently skipped.
+    """
+    if not INFRA_DIR.is_dir():
+        return
+    scripts = sorted(p for p in INFRA_DIR.glob('*/_setup/run') if p.is_file())
+    if not scripts:
+        return
+    null_script = INFRA_DIR / '_framework-pkg/_setup/run'
+    ordered = (
+        ([null_script] if null_script in scripts else []) +
+        [s for s in scripts if s != null_script]
+    )
+    print('\n=== package setup ===')
+    for script in ordered:
+        pkg = script.parts[-3]  # infra/<pkg>/_setup/run
+        print(f'\n--- [setup] {pkg} ---')
+        _stream([str(script)])
+    print('\n=== package setup done ===')
+
+
+def seed_packages():
+    """Run cloud account seeding for packages that have a _setup/seed script.
+
+    For each package with infra/<pkg>/_setup/seed, runs in order:
+      1. seed --login   (verify / refresh cloud auth)
+      2. seed --seed    (create/confirm cloud accounts idempotently)
+      3. seed --test    (verify access)
+    """
+    seeds = sorted(p for p in INFRA_DIR.glob('*/_setup/seed') if p.is_file())
+    if not seeds:
+        print('No _setup/seed scripts found — nothing to seed.')
+        return
+    print('\n=== package seed ===')
+    for script in seeds:
+        pkg = script.parts[-3]
+        for step, flag in [('login', '--login'), ('seed', '--seed'), ('test', '--test')]:
+            print(f'\n--- [seed:{step}] {pkg} ---')
+            _stream([str(script), flag])
+    print('\n=== package seed done ===')
+
+
+def ensure_backend():
+    _stream(['bash', '-c', f'source {INIT_SH} && ensure_backend'])
+
+
+# ── wave delegation ────────────────────────────────────────────────────────────
+
+def _delegate_to_wave_mgr(argv: list):
+    """Run wave-mgr with the given argv and exit with its return code."""
+    result = subprocess.run([str(WAVE_MGR)] + argv, env=ENV)
+    sys.exit(result.returncode)
+
+
+def _warn(msg: str):
+    print(f'\nWARN: {msg}', file=sys.stderr)
+
+
+# ── arg parsing ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(prog='./run', add_help=True)
+    p.add_argument('--bootstrap',           action='store_true', help='ensure infra/_framework-pkg symlink is in place (idempotent)')
+    p.add_argument('-b', '--build',         action='store_true', help='bootstrap + sync + setup + backend + apply waves')
+    p.add_argument('-Y', '--sync-packages', action='store_true', dest='sync_packages')
+    p.add_argument('-S', '--setup-packages', action='store_true', dest='setup_packages')
+    p.add_argument('-P', '--seed-packages', action='store_true', dest='seed_packages')
+    p.add_argument('-e', '--ensure-backend', action='store_true', dest='ensure_backend')
+    p.add_argument('-i', '--ignore-errors', action='store_true', dest='ignore_errors')
+    args, wave_args = p.parse_known_args()
+    return args, wave_args
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    args, wave_args = parse_args()
+
+    if args.bootstrap:
+        _bootstrap()
+        return
+
+    if args.sync_packages and not args.build:
+        sync_packages()
+        return
+    if args.setup_packages and not args.build:
+        setup_packages()
+        return
+    if args.seed_packages:
+        seed_packages()
+        return
+    if args.ensure_backend and not args.build:
+        ensure_backend()
+        return
+
+    if args.build:
+        ignore = args.ignore_errors
+        # --build alone (no wave filter) implies sync; targeted builds skip sync
+        if args.sync_packages or not wave_args:
+            try:
+                sync_packages()
+            except subprocess.CalledProcessError as e:
+                if not ignore:
+                    raise
+                _warn(f'sync-packages failed (exit {e.returncode}) — continuing')
+        try:
+            setup_packages()
+        except subprocess.CalledProcessError as e:
+            if not ignore:
+                raise
+            _warn(f'setup-packages failed (exit {e.returncode}) — continuing')
+        try:
+            ensure_backend()
+        except subprocess.CalledProcessError as e:
+            if not ignore:
+                raise
+            _warn(f'ensure-backend failed (exit {e.returncode}) — continuing')
+        mgr_args = ['--apply'] + wave_args
+        if args.ignore_errors:
+            mgr_args.append('-i')
+        _delegate_to_wave_mgr(mgr_args)
+        return
+
+    # Everything else: pass through to wave-mgr unchanged
+    raw = sys.argv[1:]
+    filtered = [a for a in raw if a not in ('--bootstrap',)]
+    if filtered:
+        _delegate_to_wave_mgr(filtered)
+    else:
+        subprocess.run([str(WAVE_MGR), '--help'])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        print(f'\nERROR: command failed (exit {e.returncode})', file=sys.stderr)
+        sys.exit(e.returncode)
+    except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
+        sys.exit(130)

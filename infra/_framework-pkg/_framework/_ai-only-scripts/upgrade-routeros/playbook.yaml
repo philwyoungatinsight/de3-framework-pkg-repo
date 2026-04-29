@@ -1,0 +1,283 @@
+---
+# upgrade-routeros — upgrades MikroTik CRS317 from RouterOS 6.x to the latest
+# stable RouterOS 7.x.
+#
+# Two-step upgrade:
+#   Step 1: Upgrade to latest 6.49.x stable (e.g. 6.49.19) via check-for-updates.
+#           RouterOS 6 package manager does not offer 7.x directly.
+#   Step 2: From the latest 6.49.x, check again — if 7.x is now offered, install it.
+#           If not, use /tool fetch to download the routeros-7.x.y-arm.npk package
+#           directly from download.mikrotik.com, then reboot.
+#
+# After both steps the switch will be on RouterOS 7.x and apis:// transport will work.
+#
+# Environment variables (all set by the `run` script):
+#   ROUTEROS_HOST            — switch IP (default 192.168.88.1)
+#   ROUTEROS_USER            — SSH user (from SOPS)
+#   ROUTEROS_PASS            — SSH password (from SOPS)
+#   ROUTEROS_MGMT_GATEWAY    — temporary default route gateway (default 10.0.11.1)
+#   ROUTEROS_7_VERSION       — override RouterOS 7 version to download (default: auto)
+#   _ROUTEROS_REBOOT_WAIT_TIMEOUT — seconds to wait for each reboot (default 180)
+
+# ---------------------------------------------------------------------------
+# Phase 1: Register switch host
+# ---------------------------------------------------------------------------
+- name: Phase 1 — register RouterOS switch
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate required env vars
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'ROUTEROS_HOST') != ''
+          - lookup('env', 'ROUTEROS_PASS') != ''
+        fail_msg: "ROUTEROS_HOST and ROUTEROS_PASS must be set. Run via ./run."
+
+    - name: Register switch in in-memory inventory
+      ansible.builtin.add_host:
+        name: ros_switch
+        groups: [ros_switches]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 120
+
+# ---------------------------------------------------------------------------
+# Phase 2: Add route + DNS, check current version, upgrade to latest 6.49.x
+# ---------------------------------------------------------------------------
+- name: Phase 2 — set up internet access and upgrade to latest 6.49.x
+  hosts: ros_switches
+  gather_facts: false
+  vars:
+    mgmt_gateway: "{{ lookup('env', 'ROUTEROS_MGMT_GATEWAY') | default('10.0.11.1', true) }}"
+  tasks:
+    - name: Get current version
+      community.routeros.command:
+        commands: [/system resource print]
+      register: ros_resource
+
+    - name: Display current version
+      ansible.builtin.debug:
+        msg: "{{ ros_resource.stdout[0] }}"
+
+    - name: Already on RouterOS 7.x — nothing to do
+      ansible.builtin.meta: end_play
+      when: "'version: 7.' in ros_resource.stdout[0]"
+
+    - name: Add temporary default route via {{ mgmt_gateway }}
+      community.routeros.command:
+        commands:
+          - /ip route add dst-address=0.0.0.0/0 gateway={{ mgmt_gateway }} comment=temp-upgrade-route
+      ignore_errors: true
+
+    - name: Set temporary DNS server (8.8.8.8)
+      community.routeros.command:
+        commands: ["/ip dns set servers=8.8.8.8"]
+
+    - name: Verify internet (ping 8.8.8.8)
+      community.routeros.command:
+        commands: ["/ping address=8.8.8.8 count=3 interval=0.5"]
+      register: ping_result
+
+    - name: Fail if no internet
+      ansible.builtin.fail:
+        msg: "No internet from switch — route via {{ mgmt_gateway }} not working."
+      when: "'received=3' not in ping_result.stdout[0]"
+
+    - name: Set update channel to stable and check for updates
+      community.routeros.command:
+        commands:
+          - /system package update set channel=stable
+          - /system package update check-for-updates
+      register: update_check
+
+    - name: Show update check result
+      ansible.builtin.debug:
+        msg: "{{ update_check.stdout[0] }}"
+
+    - name: Install available updates (6.49.x → 6.49.19; switch will reboot)
+      community.routeros.command:
+        commands: [/system package update install]
+      ignore_errors: true
+
+    - name: Install triggered — waiting for reboot
+      ansible.builtin.debug:
+        msg: "Waiting for switch to reboot after 6.49.x update..."
+
+# ---------------------------------------------------------------------------
+# Phase 3: Wait for reboot after 6.49.x update
+# ---------------------------------------------------------------------------
+- name: Phase 3 — wait for switch after 6.49.x reboot
+  hosts: localhost
+  gather_facts: false
+  vars:
+    reboot_wait: "{{ lookup('env', '_ROUTEROS_REBOOT_WAIT_TIMEOUT') | default('180', true) | int }}"
+  tasks:
+    - name: "Wait up to {{ reboot_wait }}s for SSH to come back"
+      ansible.builtin.wait_for:
+        host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        port: 22
+        delay: 20
+        timeout: "{{ reboot_wait }}"
+        state: started
+        sleep: 10
+
+    - name: Extra 15s for RouterOS to finish boot
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Re-register switch for post-6.49 check
+      ansible.builtin.add_host:
+        name: ros_switch_step2
+        groups: [ros_switches_step2]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 120
+
+# ---------------------------------------------------------------------------
+# Phase 4: On 6.49.19 — check for 7.x, fetch and install if needed
+# ---------------------------------------------------------------------------
+- name: Phase 4 — upgrade from 6.49.19 to RouterOS 7.x
+  hosts: ros_switches_step2
+  gather_facts: false
+  vars:
+    mgmt_gateway: "{{ lookup('env', 'ROUTEROS_MGMT_GATEWAY') | default('10.0.11.1', true) }}"
+    ros7_version_override: "{{ lookup('env', 'ROUTEROS_7_VERSION') | default('', true) }}"
+  tasks:
+    - name: Get version after 6.49.x upgrade
+      community.routeros.command:
+        commands: [/system resource print]
+      register: ros_step2
+
+    - name: Display version
+      ansible.builtin.debug:
+        msg: "After first upgrade: {{ ros_step2.stdout[0] }}"
+
+    - name: Already on RouterOS 7.x — done
+      ansible.builtin.meta: end_play
+      when: "'version: 7.' in ros_step2.stdout[0]"
+
+    # Still on 6.x. Re-add internet access (lost on reboot) and check if 7.x is offered.
+    - name: Re-add default route (cleared by reboot)
+      community.routeros.command:
+        commands:
+          - /ip route add dst-address=0.0.0.0/0 gateway={{ mgmt_gateway }} comment=temp-upgrade-route
+      ignore_errors: true
+
+    - name: Re-set DNS (cleared by reboot)
+      community.routeros.command:
+        commands: ["/ip dns set servers=8.8.8.8"]
+
+    - name: Check if 7.x is offered via standard channel
+      community.routeros.command:
+        commands:
+          - /system package update set channel=stable
+          - /system package update check-for-updates
+      register: update_check2
+
+    - name: Show update check result
+      ansible.builtin.debug:
+        msg: "{{ update_check2.stdout[0] }}"
+
+    - name: Install via package manager if 7.x is now offered
+      community.routeros.command:
+        commands: [/system package update install]
+      ignore_errors: true
+      when: "'version: 7.' in update_check2.stdout[0]"
+      register: ros7_via_pkg
+
+    # If 7.x was not offered via package manager, download it directly.
+    # The routeros-7.x.y-arm.npk package is uploaded to the switch filesystem;
+    # RouterOS installs it automatically on the next reboot.
+    - name: Direct download — get RouterOS 7.x version if not auto-offered
+      block:
+        - name: Fetch routeros 7.x package from MikroTik download server
+          community.routeros.command:
+            commands:
+              # Try STABLE redirect URL — MikroTik may provide this for ARM
+              - /tool fetch url="https://download.mikrotik.com/routeros/STABLE/routeros-STABLE-arm.npk" dst-path=routeros7.npk mode=https check-certificate=no
+          register: fetch_result
+          ignore_errors: true
+
+        - name: Show fetch result
+          ansible.builtin.debug:
+            msg: "Fetch result: {{ fetch_result.stdout | default('(no output)') }}"
+
+        - name: Reboot to install the downloaded package
+          community.routeros.command:
+            commands: [/system reboot]
+          ignore_errors: true
+          when: fetch_result is succeeded
+      when: "'version: 7.' not in update_check2.stdout[0]"
+
+    - name: Waiting for final reboot
+      ansible.builtin.debug:
+        msg: "Switch rebooting to install RouterOS 7.x. Waiting..."
+
+# ---------------------------------------------------------------------------
+# Phase 5: Final wait + verify
+# ---------------------------------------------------------------------------
+- name: Phase 5 — wait for final reboot and verify
+  hosts: localhost
+  gather_facts: false
+  vars:
+    reboot_wait: "{{ lookup('env', '_ROUTEROS_REBOOT_WAIT_TIMEOUT') | default('180', true) | int }}"
+  tasks:
+    - name: "Wait up to {{ reboot_wait }}s for switch SSH after ROS 7 reboot"
+      ansible.builtin.wait_for:
+        host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        port: 22
+        delay: 20
+        timeout: "{{ reboot_wait }}"
+        state: started
+        sleep: 10
+
+    - name: Extra 20s for RouterOS 7 to finish initial boot
+      ansible.builtin.pause:
+        seconds: 20
+
+    - name: Register switch for final verification
+      ansible.builtin.add_host:
+        name: ros_switch_verify
+        groups: [ros_switches_verify]
+        ansible_host: "{{ lookup('env', 'ROUTEROS_HOST') }}"
+        ansible_user: "{{ lookup('env', 'ROUTEROS_USER') }}"
+        ansible_password: "{{ lookup('env', 'ROUTEROS_PASS') }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: community.routeros.routeros
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_command_timeout: 120
+
+- name: Phase 5b — verify RouterOS 7.x
+  hosts: ros_switches_verify
+  gather_facts: false
+  tasks:
+    - name: Get final version
+      community.routeros.command:
+        commands: [/system resource print]
+      register: ros_final
+
+    - name: Display final version
+      ansible.builtin.debug:
+        msg: "{{ ros_final.stdout[0] }}"
+
+    - name: Fail if still not on RouterOS 7.x
+      ansible.builtin.fail:
+        msg: "Still not on RouterOS 7.x after upgrade attempt. Output: {{ ros_final.stdout[0][:300] }}"
+      when: "'version: 7.' not in ros_final.stdout[0]"
+
+    - name: Remove temporary default route
+      community.routeros.command:
+        commands: ["/ip route remove [find comment=temp-upgrade-route]"]
+      ignore_errors: true
+
+    - name: SUCCESS
+      ansible.builtin.debug:
+        msg: "RouterOS 7 upgrade complete! Next: update mikrotik-pkg.yaml to apis://192.168.88.1:8729 and re-run the wave."

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# build-watchdog/run — Continuous build-status loop.
+#
+# Purpose:
+#   Prints one status line every 30 s showing: build running/stopped, MaaS
+#   machine states (with '!' flags for unexpected states), and the last
+#   meaningful log line from the active wave log.
+#
+# Trigger: manual (./run) or via Claude's Monitor tool.
+# Poll interval: 30 s (INTERVAL env var)
+# Timeout: none — Ctrl-C to stop.
+#
+# Env vars:
+#   INTERVAL    Poll interval in seconds (default 30)
+#   MAAS_HOST   IP of the MaaS server (default 10.0.10.11)
+#
+# Files read:
+#   $_WAVE_LOGS_DIR/latest/*.log   — wave log directory (set by set_env.sh)
+#
+# Output format:
+#   [HH:MM:SS] BUILD:RUNNING | <host>=<state>,... | <last-log-line>
+#   [HH:MM:SS] BUILD:STOPPED | <host>=<state>,... | <last-log-line>
+#
+# MaaS state flags:
+#   '<host>=<state>!'   — unexpected state (not New/Ready/Deployed/Commissioning/
+#                         Deploying/Testing/Allocated); may indicate a failure
+#
+# See also: build-watchdog/check (one-shot cron entry point used by CronCreate)
+
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "${GIT_ROOT}/set_env.sh"
+
+SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+MAAS_HOST="10.0.10.11"
+INTERVAL=30
+
+_maas_states() {
+  ${SSH} ubuntu@"${MAAS_HOST}" \
+    'maas admin machines read 2>/dev/null | python3 -c "
+import json,sys
+machines=json.load(sys.stdin)
+parts=[]
+for m in machines:
+    s=m[\"status_name\"]
+    flag=\"!\" if s not in [\"New\",\"Ready\",\"Deployed\",\"Commissioning\",\"Deploying\",\"Testing\",\"Allocated\"] else \"\"
+    parts.append(f\"{m[\"hostname\"]}={s}{flag}\")
+print(\",\".join(parts))
+"' 2>/dev/null || echo "maas-unreachable"
+}
+
+_last_log_line() {
+  local log
+  log=$(ls -t "${_WAVE_LOGS_DIR}/latest/"*.log 2>/dev/null | head -1 || true)
+  if [[ -n "${log}" ]]; then
+    grep -E "TASK \[|PLAY \[|ERROR|FAILED|fatal|ok=[0-9]|Apply complete" "${log}" 2>/dev/null \
+      | tail -1 | sed 's/^[[:space:]]*//' | cut -c1-90
+  else
+    echo "no-log"
+  fi
+}
+
+echo "=== build-watchdog started (interval=${INTERVAL}s, $(date '+%Y-%m-%d')) ==="
+while true; do
+  if pgrep -f "run --build" >/dev/null 2>&1; then
+    RUNNING="BUILD:RUNNING"
+  else
+    RUNNING="BUILD:STOPPED"
+  fi
+  MAAS=$(_maas_states)
+  LAST=$(_last_log_line)
+  echo "[$(date '+%H:%M:%S')] ${RUNNING} | ${MAAS} | ${LAST}"
+  sleep "${INTERVAL}"
+done

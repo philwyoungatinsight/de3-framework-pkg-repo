@@ -1,0 +1,5 @@
+framework_packages:
+- name: _framework-pkg
+  package_type: embedded
+  exportable: true
+  is_main_package: true

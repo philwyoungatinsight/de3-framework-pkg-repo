@@ -1,0 +1,1404 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/set_env.sh"
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+EXT_PACKAGES_DIR="$GIT_ROOT/_ext_packages"
+INFRA_DIR="$GIT_ROOT/infra"
+
+_assert_pkg_name() {
+  local name="$1"
+  [[ "$name" == *-pkg ]] && return 0
+  echo "ERROR: package name '$name' must end in '-pkg' (e.g. '${name}-pkg')" >&2
+  exit 1
+}
+
+_fw_cfg() {
+  local name="$1"
+  # config/ is highest priority (ad-hoc overrides)
+  [[ -f "$GIT_ROOT/config/$name" ]] && { echo "$GIT_ROOT/config/$name"; return; }
+  # Named main package overrides (middle tier)
+  if [[ -n "${_FRAMEWORK_MAIN_PACKAGE_DIR:-}" && \
+        -f "$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/$name" ]]; then
+    echo "$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/$name"; return
+  fi
+  # _framework-pkg/_config/_framework_settings/ fallback
+  echo "$_FRAMEWORK_PKG_DIR/_config/_framework_settings/$name"
+}
+
+PKG_REPOS_CFG="$(_fw_cfg framework_package_repositories.yaml)"
+FRAMEWORK_PKGS_CFG="$(_fw_cfg framework_packages.yaml)"
+PKG_MGMT_CFG="$(_fw_cfg framework_package_management.yaml)"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_url_to_slug() {
+  local url="${1%/}"
+  url="${url%.git}"
+  echo "${url##*/}"
+}
+
+# Returns the external_package_dir expanded to an absolute path under $HOME,
+# or empty string if not configured.
+_external_package_dir() {
+  python3 -c "
+import yaml, pathlib, os
+cfg = pathlib.Path('$PKG_MGMT_CFG')
+if not cfg.exists():
+    print(''); exit(0)
+d = yaml.safe_load(cfg.read_text()) or {}
+rel = d.get('framework_package_management', {}).get('external_package_dir', '')
+if not rel:
+    print(''); exit(0)
+home = os.path.expanduser('~')
+# '.' means repos live directly under \$HOME (e.g. \$HOME/<slug>/)
+print(home if rel == '.' else os.path.normpath(os.path.join(home, rel)))
+" 2>/dev/null || echo ""
+}
+
+# Convert a git ref to a safe directory name: / → __, empty → HEAD
+_ref_to_dir() { local r="${1:-HEAD}"; echo "${r//\//__}"; }
+
+# Full path to a clone: _ext_packages/<slug>/<ref_dir>/
+_clone_dir() { echo "$EXT_PACKAGES_DIR/$1/$(_ref_to_dir "${2:-}")"; }
+
+
+_ensure_cloned() {
+  local slug="$1" url="$2" git_ref="${3:-}"
+  local ref_dir; ref_dir=$(_ref_to_dir "$git_ref")
+
+  local ext_base
+  ext_base=$(_external_package_dir)
+  if [[ -z "$ext_base" ]]; then
+    echo "ERROR: external_package_dir is not set in framework_package_management.yaml" >&2
+    exit 1
+  fi
+
+  local ext_clone="$ext_base/$slug/$ref_dir"
+  local dest="$EXT_PACKAGES_DIR/$slug/$ref_dir"
+
+  if [[ ! -d "$ext_clone" ]]; then
+    echo "Cloning $url → $ext_clone ..."
+    mkdir -p "$ext_base/$slug"
+    git clone "$url" "$ext_clone"
+    if [[ -n "$git_ref" ]]; then
+      git -C "$ext_clone" fetch origin
+      git -C "$ext_clone" checkout "$git_ref"
+    fi
+  else
+    local existing_url
+    existing_url=$(git -C "$ext_clone" remote get-url origin 2>/dev/null || true)
+    if [[ -n "$existing_url" && "$existing_url" != "$url" ]]; then
+      echo "ERROR: $ext_clone exists but remote is '$existing_url', expected '$url'" >&2
+      exit 1
+    fi
+    if [[ -n "$git_ref" ]]; then
+      git -C "$ext_clone" fetch origin
+      git -C "$ext_clone" checkout "$git_ref"
+    fi
+  fi
+  mkdir -p "$EXT_PACKAGES_DIR/$slug"
+  ln -sfn "$ext_clone" "$dest"
+  echo "Linked: _ext_packages/$slug/$ref_dir -> $ext_clone"
+}
+
+_create_symlink() {
+  local pkg_name="$1" repo="$2" git_ref="${3:-}"
+  local ref_dir; ref_dir=$(_ref_to_dir "$git_ref")
+  local link="$INFRA_DIR/$pkg_name"
+  local target="../_ext_packages/$repo/$ref_dir/infra/$pkg_name"
+
+  if [[ -d "$link" && ! -L "$link" ]]; then
+    echo "ERROR: $link is a real directory (built-in package). Cannot import as '$pkg_name'." >&2
+    exit 1
+  fi
+  ln -sfn "$target" "$link"
+  echo "Symlink: infra/$pkg_name -> $target"
+}
+
+_check_unit_collisions() {
+  local repo="$1" pkg_name="$2" git_ref="${3:-}"
+  local ref_dir; ref_dir=$(_ref_to_dir "$git_ref")
+  local candidate_dir="$EXT_PACKAGES_DIR/$repo/$ref_dir/infra/$pkg_name"
+
+  [[ -d "$candidate_dir/_stack" ]] || return 0
+
+  while IFS= read -r candidate_tg; do
+    rel="${candidate_tg#$candidate_dir/}"
+    candidate_rel="$pkg_name/$rel"
+    while IFS= read -r existing_tg; do
+      existing_rel="${existing_tg#$INFRA_DIR/}"
+      if [[ "$existing_rel" == "$candidate_rel" ]]; then
+        echo "unit-collision: '$candidate_rel' already exists as '$existing_rel'"
+      fi
+    done < <(find "$INFRA_DIR" -name "terragrunt.hcl" \
+               -not -path "*/.terragrunt-cache/*" \
+               -not -path "*/_ext_packages/*" 2>/dev/null)
+  done < <(find "$candidate_dir/_stack" -name "terragrunt.hcl" 2>/dev/null)
+}
+
+_check_config_collisions() {
+  local repo="$1" pkg_name="$2" git_ref="${3:-}"
+  local ref_dir; ref_dir=$(_ref_to_dir "$git_ref")
+  local candidate_cfg="$EXT_PACKAGES_DIR/$repo/$ref_dir/infra/$pkg_name/_config/$pkg_name.yaml"
+  [[ -f "$candidate_cfg" ]] || return 0
+
+  python3 - "$candidate_cfg" "$INFRA_DIR" <<'PYEOF'
+import sys, yaml, pathlib
+
+def flatten(d, prefix=""):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            yield from flatten(v, f"{prefix}.{k}" if prefix else str(k))
+    else:
+        yield prefix, d
+
+candidate_cfg = pathlib.Path(sys.argv[1])
+infra_dir     = pathlib.Path(sys.argv[2])
+
+candidate_data = yaml.safe_load(candidate_cfg.read_text()) or {}
+candidate_flat = dict(flatten(candidate_data))
+
+for existing_cfg in infra_dir.rglob("_config/*.yaml"):
+    if ".terragrunt-cache" in str(existing_cfg):
+        continue
+    if existing_cfg.resolve() == candidate_cfg.resolve():
+        continue
+    existing_data = yaml.safe_load(existing_cfg.read_text()) or {}
+    existing_flat = dict(flatten(existing_data))
+    for path, cval in candidate_flat.items():
+        if path in existing_flat and existing_flat[path] != cval:
+            print(f"config-collision: '{path}' = {cval!r} in candidate, "
+                  f"{existing_flat[path]!r} in {existing_cfg.relative_to(infra_dir)}")
+PYEOF
+}
+
+_check_collisions() {
+  local repo="$1" pkg_name="$2" git_ref="${3:-}"
+  _check_unit_collisions   "$repo" "$pkg_name" "$git_ref"
+  _check_config_collisions "$repo" "$pkg_name" "$git_ref"
+}
+
+_resolve_pkg_repo() {
+  local parent_repo="$1" pkg_name="$2"
+  local parent_cfg; parent_cfg="$(_clone_dir "$parent_repo")/config/framework_packages.yaml"
+
+  if [[ ! -f "$parent_cfg" ]]; then
+    echo "$parent_repo"
+    return 0
+  fi
+
+  local source_url
+  source_url=$(python3 -c "
+import yaml, sys
+pkgs = yaml.safe_load(open('$parent_cfg'))['framework_packages']
+entry = next((p for p in pkgs if p['name'] == '$pkg_name'), {})
+print(entry.get('source', ''))
+" 2>/dev/null || true)
+
+  if [[ -n "$source_url" ]]; then
+    local slug
+    slug=$(_url_to_slug "$source_url")
+    _ensure_cloned "$slug" "$source_url"
+    echo "$slug"
+  else
+    echo "$parent_repo"
+  fi
+}
+
+_yaml_get_list() {
+  python3 -c "
+import yaml, sys
+d = yaml.safe_load(open(sys.argv[1])) or {}
+items = d.get(sys.argv[2], [])
+print(yaml.dump(items, allow_unicode=True, default_flow_style=False))" "$1" "$2"
+}
+
+_yaml_write_key() {
+  local file="$1" key="$2" data_file="$3"
+  python3 - "$file" "$key" "$data_file" <<'PYEOF'
+import yaml, sys, pathlib, tempfile, os
+
+cfg_path  = pathlib.Path(sys.argv[1])
+key       = sys.argv[2]
+data_path = pathlib.Path(sys.argv[3])
+
+existing = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+existing[key] = yaml.safe_load(data_path.read_text())
+
+tmp = cfg_path.with_suffix(".tmp")
+tmp.write_text(yaml.dump(existing, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg_path)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Rename / Copy helpers
+# ---------------------------------------------------------------------------
+
+_gcs_bucket() {
+  python3 -c "
+import os, yaml, pathlib
+git_root = pathlib.Path(os.environ.get('_GIT_ROOT', '.'))
+fw_dir = pathlib.Path(os.environ.get('_FRAMEWORK_PKG_DIR', str(git_root / 'infra' / '_framework-pkg')))
+override = git_root / 'config' / 'framework_backend.yaml'
+fallback = fw_dir / '_config' / 'framework_backend.yaml'
+cfg_path = override if override.exists() else fallback
+if not cfg_path.exists():
+    print(''); exit(0)
+cfg = yaml.safe_load(cfg_path.read_text()) or {}
+backend = cfg.get('framework_backend', {})
+if backend.get('type') != 'gcs':
+    print(''); exit(0)
+print(backend.get('config', {}).get('bucket', ''))
+" 2>/dev/null || true
+}
+
+_gcs_state_exists_for_pkg() {
+  local pkg="$1"
+  local bucket; bucket=$(_gcs_bucket)
+  [[ -z "$bucket" ]] && return 1
+  gsutil ls -r "gs://$bucket/$pkg/" 2>/dev/null | grep -q '\.tfstate$'
+}
+
+_check_gcs_locks_for_pkg() {
+  local pkg="$1"
+  local bucket; bucket=$(_gcs_bucket)
+  [[ -z "$bucket" ]] && return 0
+  local locked
+  locked=$(gsutil ls -r "gs://$bucket/$pkg/" 2>/dev/null | grep '\.tflock$' | head -5 || true)
+  if [[ -n "$locked" ]]; then
+    echo "ERROR: GCS locks found under $pkg/ — resolve them before rename:" >&2
+    echo "$locked" >&2; exit 1
+  fi
+}
+
+_migrate_pkg_gcs_state() {
+  local src="$1" dst="$2" dry_run="${3:-false}" op="${4:-move}"
+  local bucket; bucket=$(_gcs_bucket)
+  if [[ -z "$bucket" ]]; then
+    echo "  GCS state: no gcs backend configured — skipping"; return 0
+  fi
+  local state_files
+  state_files=$(gsutil ls -r "gs://$bucket/$src/" 2>/dev/null \
+    | grep -E '\.(tfstate|tflock)$' || true)
+  if [[ -z "$state_files" ]]; then
+    echo "  GCS state: nothing to migrate (no state under $src/)"; return 0
+  fi
+  local count=0
+  while IFS= read -r src_path; do
+    local rel="${src_path#gs://$bucket/$src/}"
+    local dst_path="gs://$bucket/$dst/$rel"
+    if [[ "$dry_run" == true ]]; then
+      if [[ "$op" == "copy" ]]; then
+        echo "  [dry-run] gsutil cp $src_path $dst_path"
+      else
+        echo "  [dry-run] gsutil cp $src_path $dst_path && gsutil rm $src_path"
+      fi
+    else
+      gsutil -q cp "$src_path" "$dst_path"
+      [[ "$op" != "copy" ]] && gsutil -q rm "$src_path"
+      (( count++ )) || true
+    fi
+  done <<< "$state_files"
+  if [[ "$dry_run" == false ]]; then
+    [[ "$op" == "copy" ]] && echo "  GCS state: copied $count file(s) (source preserved)" \
+                           || echo "  GCS state: migrated $count file(s)"
+  fi
+}
+
+_rename_pkg_yaml_keys() {
+  local yaml_file="$1" src_name="$2" dst_name="$3"
+  [[ -f "$yaml_file" ]] || return 0
+  python3 - "$yaml_file" "$src_name" "$dst_name" <<'PYEOF'
+import sys, pathlib, os
+cfg_path = pathlib.Path(sys.argv[1])
+src_name, dst_name = sys.argv[2], sys.argv[3]
+try:
+    from ruamel.yaml import YAML as _YAML
+    import io as _io
+    _y = _YAML(); _y.preserve_quotes = True
+    def _load(p): return _y.load(p.read_text())
+    def _dump(d, p):
+        buf = _io.StringIO(); _y.dump(d, buf)
+        tmp = p.with_suffix('.tmp'); tmp.write_text(buf.getvalue()); os.replace(tmp, p)
+except ImportError:
+    import yaml as _yaml
+    def _load(p): return _yaml.safe_load(p.read_text()) or {}
+    def _dump(d, p):
+        tmp = p.with_suffix('.tmp')
+        tmp.write_text(_yaml.dump(d, allow_unicode=True, default_flow_style=False))
+        os.replace(tmp, p)
+
+data = _load(cfg_path)
+if src_name not in data:
+    sys.exit(0)
+pkg_data = data.pop(src_name)
+data[dst_name] = pkg_data
+
+cp = pkg_data.get('config_params') or {}
+prefix = src_name + '/'
+new_cp = {}
+for k, v in list(cp.items()):
+    new_cp[(dst_name + '/' + k[len(prefix):]) if k.startswith(prefix) else k] = v
+if new_cp:
+    pkg_data['config_params'] = new_cp
+
+_dump(data, cfg_path)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+_cmd_sync() {
+  echo "==> pkg-mgr sync"
+
+  # For each package in framework_packages.yaml that has repo: set
+  python3 - "$FRAMEWORK_PKGS_CFG" "$EXT_PACKAGES_DIR" "$INFRA_DIR" <<'PYEOF' | while read -r _ pkg_name repo source_url git_ref; do
+import yaml, sys, pathlib
+
+cfg = pathlib.Path(sys.argv[1])
+ext_dir = pathlib.Path(sys.argv[2])
+infra_dir = pathlib.Path(sys.argv[3])
+
+pkgs = yaml.safe_load(cfg.read_text()).get("framework_packages", [])
+
+missing = [p["name"] for p in pkgs if p.get("repo") and not p.get("git_ref")]
+if missing:
+    for name in missing:
+        print(f"ERROR: '{name}' has repo: set but no git_ref — git_ref is required", file=sys.stderr)
+    sys.exit(1)
+
+invalid = []
+for p in pkgs:
+    if not p["name"].endswith("-pkg"):
+        invalid.append(f"  '{p['name']}': package name must end in '-pkg'")
+    pt = p.get("package_type", "")
+    if pt not in ("embedded", "external"):
+        invalid.append(f"  '{p['name']}': package_type must be 'embedded' or 'external', got '{pt}'")
+    elif pt == "external" and not p.get("repo"):
+        invalid.append(f"  '{p['name']}': package_type: external requires a repo: field")
+    elif pt == "embedded" and p.get("repo"):
+        invalid.append(f"  '{p['name']}': package_type: embedded must not have a repo: field")
+    if "import_path" in p:
+        invalid.append(f"  '{p['name']}': import_path is not supported — the symlink path always equals the package name")
+if invalid:
+    for msg in invalid:
+        print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+for p in pkgs:
+    if p.get("package_type") != "external":
+        continue
+    repo = p.get("repo", "")
+    name = p["name"]
+    source = p.get("source", "")
+    ref = p.get("git_ref", "")
+    print(f"ENTRY {name} {repo} {source} {ref}")
+PYEOF
+    # Ensure cloned if source URL present
+    if [[ -n "$source_url" && "$source_url" != "None" ]]; then
+      slug=$(_url_to_slug "$source_url")
+      _ensure_cloned "$slug" "$source_url" "$git_ref"
+      repo="$slug"
+    else
+      # Parent repo must already be cloned (slug dir contains ref subdirs)
+      if [[ ! -d "$EXT_PACKAGES_DIR/$repo" ]]; then
+        echo "WARNING: parent repo '$repo' not cloned; skipping $pkg_name" >&2
+        continue
+      fi
+    fi
+    _create_symlink "$pkg_name" "$repo" "$git_ref"
+  done
+
+  # Remove symlinks for packages no longer in config
+  active_names=$(python3 - "$FRAMEWORK_PKGS_CFG" <<'PYEOF'
+import yaml, sys
+pkgs = yaml.safe_load(open(sys.argv[1])).get("framework_packages", [])
+print(" ".join(p["name"] for p in pkgs if p.get("package_type") == "external"))
+PYEOF
+) || true
+
+  for link in "$INFRA_DIR"/*/; do
+    link="${link%/}"
+    name="${link##*/}"
+    if [[ -L "$link" ]]; then
+      if [[ -z "$active_names" ]] || ! echo " $active_names " | grep -q " $name "; then
+        echo "Removing stale symlink: infra/$name"
+        rm "$link"
+      fi
+    fi
+  done
+
+  echo "==> sync complete"
+}
+
+_cmd_add_repo() {
+  local url="${1:-}" name="${2:-}"
+  if [[ -z "$url" ]]; then
+    echo "Usage: pkg-mgr add-repo <url> [<name>]" >&2
+    exit 1
+  fi
+  if [[ -z "$name" ]]; then
+    name=$(_url_to_slug "$url")
+  fi
+
+  _ensure_cloned "$name" "$url"
+
+  # Add to framework_package_repositories.yaml
+  python3 - "$PKG_REPOS_CFG" "$name" "$url" <<'PYEOF'
+import yaml, sys, pathlib, os
+
+cfg_path = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+url = sys.argv[3]
+
+existing = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+repos = existing.get("framework_package_repositories", [])
+
+if any(r.get("name") == name for r in repos):
+    print(f"Repo '{name}' already registered.")
+    sys.exit(0)
+
+repos.append({"name": name, "url": url})
+existing["framework_package_repositories"] = repos
+
+tmp = cfg_path.with_suffix(".tmp")
+tmp.write_text(yaml.dump(existing, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg_path)
+print(f"Registered repo '{name}' ({url})")
+PYEOF
+}
+
+_cmd_remove_repo() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: pkg-mgr remove-repo <name>" >&2
+    exit 1
+  fi
+
+  # Remove all imported packages from that repo
+  pkg_names=$(python3 - "$FRAMEWORK_PKGS_CFG" "$name" <<'PYEOF'
+import yaml, sys
+pkgs = yaml.safe_load(open(sys.argv[1])).get("framework_packages", [])
+print(" ".join(p["name"] for p in pkgs if p.get("repo") == sys.argv[2]))
+PYEOF
+) || true
+
+  for pkg_name in $pkg_names; do
+    _cmd_remove "$pkg_name"
+  done
+
+  # Delete the clone
+  local dest="$EXT_PACKAGES_DIR/$name"
+  if [[ -d "$dest" ]]; then
+    echo "Removing _ext_packages/$name/ ..."
+    rm -rf "$dest"
+  fi
+
+  # Remove from framework_package_repositories.yaml
+  python3 - "$PKG_REPOS_CFG" "$name" <<'PYEOF'
+import yaml, sys, pathlib, os
+
+cfg_path = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+
+existing = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+repos = [r for r in existing.get("framework_package_repositories", []) if r.get("name") != name]
+existing["framework_package_repositories"] = repos
+
+tmp = cfg_path.with_suffix(".tmp")
+tmp.write_text(yaml.dump(existing, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg_path)
+print(f"Removed repo '{name}'")
+PYEOF
+}
+
+_cmd_import() {
+  local repo="${1:-}" pkg_name="${2:-}"
+  shift 2 || true
+  local git_ref=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --git-ref) git_ref="${2:-}"; shift 2 ;;
+      *) echo "ERROR: unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+  if [[ -z "$repo" || -z "$pkg_name" ]]; then
+    echo "Usage: pkg-mgr import <repo> <pkg> --git-ref <ref>" >&2
+    exit 1
+  fi
+  if [[ -z "$git_ref" ]]; then
+    echo "ERROR: --git-ref <ref> is required (e.g. --git-ref main)" >&2
+    exit 1
+  fi
+  _assert_pkg_name "$pkg_name"
+
+  if [[ ! -d "$EXT_PACKAGES_DIR/$repo" ]]; then
+    echo "ERROR: repo '$repo' not cloned. Run: pkg-mgr add-repo <url> $repo" >&2
+    exit 1
+  fi
+
+  read -r actual_repo < <(_resolve_pkg_repo "$repo" "$pkg_name")
+
+  # Collision check
+  collisions=$(_check_collisions "$actual_repo" "$pkg_name" "$git_ref")
+  unit_collisions=$(echo "$collisions" | grep "^unit-collision:" || true)
+  config_collisions=$(echo "$collisions" | grep "^config-collision:" || true)
+
+  if [[ -n "$unit_collisions" ]]; then
+    echo "ERROR: unit collisions detected — import blocked:" >&2
+    echo "$unit_collisions" >&2
+    exit 1
+  fi
+  if [[ -n "$config_collisions" ]]; then
+    echo "WARNING: config collisions detected (proceeding — acknowledge before use):"
+    echo "$config_collisions"
+  fi
+
+  # Determine source URL for the entry
+  local source_url=""
+  if [[ "$actual_repo" != "$repo" ]]; then
+    source_url=$(python3 -c "
+import yaml
+pkgs = yaml.safe_load(open('$EXT_PACKAGES_DIR/$repo/config/framework_packages.yaml'))['framework_packages']
+e = next((p for p in pkgs if p['name'] == '$pkg_name'), {})
+print(e.get('source', ''))
+" 2>/dev/null || true)
+  fi
+
+  # Add entry to framework_packages.yaml
+  python3 - "$FRAMEWORK_PKGS_CFG" "$pkg_name" "$actual_repo" "$source_url" "$git_ref" <<'PYEOF'
+import yaml, sys, pathlib, os
+
+cfg_path = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+repo = sys.argv[3]
+source_url = sys.argv[4]
+git_ref = sys.argv[5]
+
+existing = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+pkgs = existing.get("framework_packages", [])
+
+if any(p.get("name") == name for p in pkgs):
+    print(f"Package '{name}' already in framework_packages.yaml")
+    sys.exit(0)
+
+entry = {"name": name, "package_type": "external", "exportable": False, "repo": repo}
+if source_url:
+    entry["source"] = source_url
+if git_ref:
+    entry["git_ref"] = git_ref
+
+pkgs.append(entry)
+existing["framework_packages"] = pkgs
+
+tmp = cfg_path.with_suffix(".tmp")
+tmp.write_text(yaml.dump(existing, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg_path)
+print(f"Added '{name}' to framework_packages.yaml")
+PYEOF
+
+  _create_symlink "$pkg_name" "$actual_repo" "$git_ref"
+}
+
+_cmd_remove() {
+  local pkg_name="${1:-}"
+  if [[ -z "$pkg_name" ]]; then
+    echo "Usage: pkg-mgr remove <pkg>" >&2
+    exit 1
+  fi
+
+  local link="$INFRA_DIR/$pkg_name"
+  if [[ -L "$link" ]]; then
+    rm "$link"
+    echo "Removed symlink: infra/$pkg_name"
+  fi
+
+  python3 - "$FRAMEWORK_PKGS_CFG" "$pkg_name" <<'PYEOF'
+import yaml, sys, pathlib, os
+
+cfg_path = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+
+existing = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+pkgs = [p for p in existing.get("framework_packages", []) if p.get("name") != name]
+existing["framework_packages"] = pkgs
+
+tmp = cfg_path.with_suffix(".tmp")
+tmp.write_text(yaml.dump(existing, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg_path)
+print(f"Removed '{name}' from framework_packages.yaml")
+PYEOF
+}
+
+_cmd_list_remote() {
+  local repo="${1:-}"
+  if [[ -z "$repo" ]]; then
+    echo "Usage: pkg-mgr list-remote <repo>" >&2
+    exit 1
+  fi
+
+  if [[ ! -d "$EXT_PACKAGES_DIR/$repo" ]]; then
+    echo "ERROR: repo '$repo' not cloned. Run: pkg-mgr add-repo <url> $repo" >&2
+    exit 1
+  fi
+
+  local remote_cfg; remote_cfg="$(_clone_dir "$repo")/config/framework_packages.yaml"
+  if [[ ! -f "$remote_cfg" ]]; then
+    echo "No framework_packages.yaml in repo '$repo'" >&2
+    exit 1
+  fi
+
+  python3 - "$remote_cfg" "$FRAMEWORK_PKGS_CFG" <<'PYEOF'
+import yaml, sys
+
+remote_pkgs = yaml.safe_load(open(sys.argv[1])).get("framework_packages", [])
+local_pkgs  = yaml.safe_load(open(sys.argv[2])).get("framework_packages", [])
+imported    = {p["name"] for p in local_pkgs}
+
+for p in remote_pkgs:
+    if not p.get("exportable", False):
+        continue
+    print(yaml.dump([{
+        "name": p["name"],
+        "already_imported": p["name"] in imported,
+        "source": p.get("source", ""),
+    }], allow_unicode=True, default_flow_style=False).strip())
+PYEOF
+}
+
+_cmd_check() {
+  local repo="${1:-}" pkg_name="${2:-}"
+  if [[ -z "$repo" || -z "$pkg_name" ]]; then
+    echo "Usage: pkg-mgr check <repo> <pkg>" >&2
+    exit 1
+  fi
+
+  read -r actual_repo < <(_resolve_pkg_repo "$repo" "$pkg_name")
+  collisions=$(_check_collisions "$actual_repo" "$pkg_name")
+
+  if [[ -n "$collisions" ]]; then
+    echo "$collisions"
+    exit 1
+  fi
+  echo "No collisions detected for '$pkg_name' from '$repo'"
+}
+
+_cmd_clean() {
+  local mode="${1:-}"
+
+  if [[ "$mode" == "--all" ]]; then
+    echo "==> pkg-mgr clean --all"
+
+    # Remove all infra/<pkg> symlinks that point into _ext_packages/
+    for link in "$INFRA_DIR"/*; do
+      if [[ -L "$link" ]]; then
+        local target
+        target=$(readlink "$link")
+        if [[ "$target" == *"_ext_packages"* ]]; then
+          echo "Removing symlink: infra/${link##*/}"
+          rm "$link"
+        fi
+      fi
+    done
+
+    # Delete all clones
+    if [[ -d "$EXT_PACKAGES_DIR" ]]; then
+      echo "Removing _ext_packages/ ..."
+      rm -rf "$EXT_PACKAGES_DIR"
+    fi
+
+    echo "==> clean --all complete (run 'pkg-mgr sync' to restore)"
+    return 0
+  fi
+
+  echo "==> pkg-mgr clean"
+
+  # 1. Remove dangling symlinks (point to non-existent target)
+  for link in "$INFRA_DIR"/*; do
+    if [[ -L "$link" && ! -e "$link" ]]; then
+      echo "Removing dangling symlink: infra/${link##*/}"
+      rm "$link"
+    fi
+  done
+
+  # 2. Remove orphaned clones — (slug, ref_dir) pairs not in any active entry
+  if [[ -d "$EXT_PACKAGES_DIR" ]]; then
+    active_pairs=$(python3 - "$FRAMEWORK_PKGS_CFG" <<'PYEOF'
+import yaml, sys
+pkgs = yaml.safe_load(open(sys.argv[1])).get("framework_packages", [])
+for p in pkgs:
+    if p.get("package_type") != "external":
+        continue
+    ref_dir = (p.get("git_ref", "") or "HEAD").replace("/", "__")
+    print(f"{p['repo']} {ref_dir}")
+PYEOF
+)
+
+    for slug_dir in "$EXT_PACKAGES_DIR"/*/; do
+      [[ -d "$slug_dir" ]] || continue
+      slug="${slug_dir%/}"; slug="${slug##*/}"
+      for ref_clone in "$slug_dir"*/; do
+        [[ -d "$ref_clone" ]] || continue
+        ref_dir="${ref_clone%/}"; ref_dir="${ref_dir##*/}"
+        if ! echo "$active_pairs" | grep -q "^$slug $ref_dir$"; then
+          echo "Removing orphaned clone: _ext_packages/$slug/$ref_dir/"
+          rm -rf "$ref_clone"
+        fi
+      done
+      # Remove slug dir if now empty
+      [[ -z "$(ls -A "$slug_dir" 2>/dev/null)" ]] && rmdir "$slug_dir"
+    done
+  fi
+
+  echo "==> clean complete"
+}
+
+_cmd_status() {
+  local verbose="${1:-}"
+  python3 - "$FRAMEWORK_PKGS_CFG" "$INFRA_DIR" "$PKG_MGMT_CFG" "$PKG_REPOS_CFG" "$EXT_PACKAGES_DIR" "$verbose" <<'PYEOF'
+import yaml, sys, pathlib, os
+
+cfg_path   = pathlib.Path(sys.argv[1])
+infra_dir  = pathlib.Path(sys.argv[2])
+mgmt_path  = pathlib.Path(sys.argv[3])
+repos_path = pathlib.Path(sys.argv[4])
+ext_dir    = pathlib.Path(sys.argv[5])
+
+verbose   = sys.argv[6] == '--verbose'
+
+use_color = sys.__stdout__.isatty() and not os.environ.get('NO_COLOR')
+BOLD    = '\033[1m'  if use_color else ''
+RESET   = '\033[0m'  if use_color else ''
+CYAN    = '\033[36m' if use_color else ''
+GREEN   = '\033[32m' if use_color else ''
+YELLOW  = '\033[33m' if use_color else ''
+RED     = '\033[31m' if use_color else ''
+DIM     = '\033[2m'  if use_color else ''
+MAGENTA = '\033[35m' if use_color else ''
+
+def cell(text, width, color=''):
+    padded = text.ljust(width)
+    return f'{color}{padded}{RESET}' if color else padded
+
+def rcell(text, width, color=''):
+    padded = str(text).rjust(width)
+    return f'{color}{padded}{RESET}' if color else padded
+
+def print_table(headers, rows, col_colors):
+    W = [
+        max(len(headers[i]), max((len(r[i]) for r in rows), default=0))
+        for i in range(len(headers))
+    ]
+    divider = '┼'.join('─' * (w + 2) for w in W)
+    hdr = ' │ '.join(
+        (headers[i].rjust(W[i]) if i == 0 else headers[i].ljust(W[i]))
+        for i in range(len(headers))
+    )
+    print(f'{BOLD} {hdr} {RESET}')
+    print(divider)
+    for row in rows:
+        cols = []
+        for i, (val, color) in enumerate(zip(row, col_colors)):
+            if i == 0:
+                cols.append(val.rjust(W[i]))
+            else:
+                cols.append(cell(val, W[i], color(val) if callable(color) else color))
+        print(f' {cols[0]} │ {" │ ".join(cols[1:])} ')
+
+pkgs = yaml.safe_load(cfg_path.read_text()).get('framework_packages', []) if cfg_path.exists() else []
+imported = [p for p in pkgs if p.get('package_type') == 'external']
+builtin  = [p for p in pkgs if p.get('package_type') == 'embedded']
+
+mgmt = {}
+if mgmt_path.exists():
+    mgmt = yaml.safe_load(mgmt_path.read_text()) or {}
+pm = mgmt.get('framework_package_management', {})
+ext_pkg_dir_rel  = pm.get('external_package_dir', '')
+_home = os.path.expanduser('~')
+ext_pkg_dir_abs  = (_home if ext_pkg_dir_rel == '.' else
+                    os.path.normpath(os.path.join(_home, ext_pkg_dir_rel))) if ext_pkg_dir_rel else ''
+
+# --- Section 1: Config header ---
+print(f'{BOLD}Package Manager Config{RESET}')
+if ext_pkg_dir_abs:
+    print(f'  external_package_dir : {DIM}{ext_pkg_dir_abs}{RESET}')
+else:
+    print(f'  {RED}external_package_dir not set — run will fail{RESET}')
+
+# --- Section 2: Repos table ---
+def ref_to_dir(ref): return (ref or "HEAD").replace("/", "__")
+
+repo_clones = {}  # (slug, ref_dir) → {pkgs, source, git_ref}
+for p in imported:
+    slug    = p.get('repo', '')
+    name    = p['name']
+    git_ref = p.get('git_ref', '')
+    rd      = ref_to_dir(git_ref)
+    key     = (slug, rd)
+    if key not in repo_clones:
+        repo_clones[key] = {'pkgs': [], 'source': p.get('source', ''), 'git_ref': git_ref}
+    repo_clones[key]['pkgs'].append(name)
+
+if repo_clones:
+    print()
+    print(f'{BOLD}Repos{RESET}')
+
+    def repo_method(slug):
+        return 'linked_copy'
+
+    def clone_loc(slug, rd):
+        entry = ext_dir / slug / rd
+        if entry.is_symlink():
+            return f'→ {os.readlink(entry)}'
+        elif entry.is_dir():
+            return f'{slug}/{rd}'
+        return 'not cloned'
+
+    repo_rows = []
+    repo_loc_colors = {}
+    for (slug, rd), info in repo_clones.items():
+        entry = ext_dir / slug / rd
+        if entry.is_symlink():
+            loc_color = GREEN
+        elif entry.is_dir():
+            loc_color = CYAN
+        else:
+            loc_color = RED
+        repo_loc_colors[(slug, rd)] = loc_color
+        ref_label = info['git_ref'] or '(default)'
+        repo_rows.append((slug, ref_label, repo_method(slug), info['source'], clone_loc(slug, rd), str(len(info['pkgs']))))
+
+    RHDRS = ('Repo', 'Ref', 'Method', 'Source', 'Clone', '#')
+    RW = [max(len(RHDRS[i]), max((len(r[i]) for r in repo_rows), default=0)) for i in range(6)]
+    divider = '┼'.join('─' * (w + 2) for w in RW)
+    hdr = ' │ '.join(RHDRS[i].ljust(RW[i]) for i in range(6))
+    print(f'{BOLD} {hdr} {RESET}')
+    print(divider)
+    for (slug, rd), info in repo_clones.items():
+        ref_label = info['git_ref'] or '(default)'
+        method    = repo_method(slug)
+        source    = info['source']
+        loc       = clone_loc(slug, rd)
+        npkgs     = str(len(info['pkgs']))
+        cols = [
+            cell(slug,      RW[0], CYAN),
+            cell(ref_label, RW[1], CYAN if info['git_ref'] else DIM),
+            cell(method,    RW[2], YELLOW if method == 'linked_copy' else DIM),
+            cell(source,    RW[3], DIM),
+            cell(loc,       RW[4], repo_loc_colors.get((slug, rd), DIM)),
+            rcell(npkgs,    RW[5], MAGENTA),
+        ]
+        print(f' {" │ ".join(cols)} ')
+
+# --- Section 3: Packages table ---
+def get_active_ref(clone_path):
+    import subprocess
+    try:
+        branch = subprocess.check_output(
+            ["git", "-C", str(clone_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if branch == "HEAD":  # detached HEAD — show short SHA instead
+            return subprocess.check_output(
+                ["git", "-C", str(clone_path), "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        return branch
+    except Exception:
+        return ""
+
+def get_version(pkg_name):
+    try:
+        cfg = infra_dir / pkg_name / '_config' / f'{pkg_name}.yaml'
+        if not cfg.exists():
+            return ''
+        data = yaml.safe_load(cfg.read_text()) or {}
+        caps = data.get(pkg_name, {}).get('_provides_capability', [])
+        for cap in (caps or []):
+            if isinstance(cap, dict):
+                for k, v in cap.items():
+                    if k == pkg_name:
+                        return str(v)
+        return ''
+    except Exception:
+        return ''
+
+def sym_status(pkg_name):
+    link = infra_dir / pkg_name
+    if link.is_symlink():
+        return ('✓', GREEN) if link.exists() else ('!', YELLOW)
+    elif link.is_dir():
+        return ('·', DIM)
+    return ('✗', RED)
+
+print()
+print(f'{BOLD}Packages{RESET}')
+
+def resolved_path(pkg_name):
+    link = infra_dir / pkg_name
+    try:
+        return os.path.realpath(str(link))
+    except Exception:
+        return '(not found)'
+
+all_pkgs = imported + builtin
+pkg_rows = []
+pkg_sym_colors = []
+for p in all_pkgs:
+    name    = p['name']
+    repo    = p.get('repo', '—')
+    method  = p.get('package_type', 'unknown')
+    version = get_version(name)
+    git_ref = p.get('git_ref', '') if repo != '—' else ''
+    ref     = get_active_ref(ext_dir / repo / ref_to_dir(git_ref)) if repo != '—' else ''
+    sym, sym_color = sym_status(name)
+    path    = resolved_path(name) if verbose else ''
+    pkg_rows.append((str(len(pkg_rows) + 1), name, repo, method, version, ref, sym, path))
+    pkg_sym_colors.append(sym_color)
+
+PHDRS = ('#', 'Package', 'Repo', 'Method', 'Version', 'Ref', 'Link', 'Path') if verbose else \
+        ('#', 'Package', 'Repo', 'Method', 'Version', 'Ref', 'Link')
+ncols = len(PHDRS)
+PW = [max(len(PHDRS[i]), max((len(r[i]) for r in pkg_rows), default=0)) for i in range(ncols)]
+divider = '┼'.join('─' * (w + 2) for w in PW)
+hdr = ' │ '.join(
+    (PHDRS[i].rjust(PW[i]) if i == 0 else PHDRS[i].ljust(PW[i]))
+    for i in range(ncols)
+)
+print(f'{BOLD} {hdr} {RESET}')
+print(divider)
+for i, r in enumerate(pkg_rows):
+    idx, name, repo, method, version, ref, sym, path = r
+    sym_color = pkg_sym_colors[i]
+    cols = [
+        idx.rjust(PW[0]),
+        cell(name,    PW[1], CYAN),
+        cell(repo,    PW[2], YELLOW if repo != '—' else DIM),
+        cell(method,  PW[3], DIM),
+        cell(version, PW[4], GREEN if version else DIM),
+        cell(ref,     PW[5], CYAN if ref else DIM),
+        f'{sym_color}{sym}{RESET}' if sym_color else sym,
+    ]
+    if verbose:
+        cols.append(cell(path, PW[7], DIM))
+    print(f' {cols[0]} │ {" │ ".join(cols[1:])} ')
+
+n_clones = len(repo_clones)
+print(f'\n{DIM}{len(imported)} external · {len(builtin)} embedded · {n_clones} clone{"s" if n_clones != 1 else ""}{RESET}')
+PYEOF
+}
+
+_cmd_rename() {
+  local src="${1:-}" dst="${2:-}"
+  shift 2 || true
+  local dry_run=false skip_state=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    dry_run=true ;;
+      --skip-state) skip_state=true ;;
+      *) echo "ERROR: unknown option: $1" >&2; exit 1 ;;
+    esac; shift
+  done
+  if [[ -z "$src" || -z "$dst" ]]; then
+    echo "Usage: pkg-mgr rename <src-pkg> <dst-pkg> [--dry-run] [--skip-state]" >&2; exit 1
+  fi
+  _assert_pkg_name "$dst"
+
+  local src_dir="$INFRA_DIR/$src" dst_dir="$INFRA_DIR/$dst"
+
+  # ---- Imported package (symlink) ----
+  if [[ -L "$src_dir" ]]; then
+    [[ -e "$dst_dir" ]] && { echo "ERROR: infra/$dst already exists" >&2; exit 1; }
+    local target; target=$(readlink "$src_dir")
+    if [[ "$dry_run" == true ]]; then
+      echo "[dry-run] rename symlink: infra/$src → infra/$dst (→ $target)"
+      return 0
+    fi
+    rm "$src_dir"; ln -s "$target" "$dst_dir"
+    echo "  symlink: infra/$src → infra/$dst"
+    python3 - "$FRAMEWORK_PKGS_CFG" "$src" "$dst" <<'PYEOF'
+import yaml, sys, pathlib, os
+cfg = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+d = yaml.safe_load(cfg.read_text()) or {}
+pkgs = d.get("framework_packages", [])
+for p in pkgs:
+    if p.get("name") == src_n: p["name"] = dst_n; break
+d["framework_packages"] = pkgs
+tmp = cfg.with_suffix(".tmp")
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg)
+print(f"  framework_packages.yaml: '{src_n}' → '{dst_n}'")
+PYEOF
+    echo "==> rename complete (imported): $src → $dst"
+    return 0
+  fi
+
+  # ---- Local package (real directory) ----
+  [[ ! -d "$src_dir" ]] && { echo "ERROR: infra/$src does not exist" >&2; exit 1; }
+  [[ -e "$dst_dir" ]] && { echo "ERROR: infra/$dst already exists" >&2; exit 1; }
+  [[ "$dry_run" == false && "$skip_state" == false ]] && _check_gcs_locks_for_pkg "$src"
+
+  echo "==> pkg-mgr rename $src → $dst"
+
+  # Phase 1: Filesystem
+  if [[ "$dry_run" == true ]]; then
+    echo "  [dry-run] git mv infra/$src infra/$dst"
+  else
+    git -C "$GIT_ROOT" mv "infra/$src" "infra/$dst"
+    echo "  filesystem: infra/$src → infra/$dst"
+  fi
+
+  # Phase 2: Config file rename
+  local old_cfg="$dst_dir/_config/${src}.yaml"
+  local new_cfg="$dst_dir/_config/${dst}.yaml"
+  if [[ "$dry_run" == true ]]; then
+    [[ -f "$old_cfg" ]] && echo "  [dry-run] git mv _config/${src}.yaml _config/${dst}.yaml + rename key"
+  elif [[ -f "$old_cfg" ]]; then
+    git -C "$GIT_ROOT" mv "infra/$dst/_config/${src}.yaml" "infra/$dst/_config/${dst}.yaml"
+    _rename_pkg_yaml_keys "$new_cfg" "$src" "$dst"
+    echo "  config YAML: ${src}.yaml → ${dst}.yaml (key renamed)"
+  fi
+
+  # Phase 3: SOPS secrets file rename + key update
+  local old_sops="$dst_dir/_config/${src}_secrets.sops.yaml"
+  local new_sops="$dst_dir/_config/${dst}_secrets.sops.yaml"
+  if [[ "$dry_run" == true ]]; then
+    [[ -f "$old_sops" ]] && echo "  [dry-run] rename ${src}_secrets.sops.yaml → ${dst}_secrets.sops.yaml + re-key"
+  elif [[ -f "$old_sops" ]]; then
+    local tmp_sops; tmp_sops=$(mktemp /tmp/pkg-mgr-sops-XXXXXX.yaml)
+    sops --decrypt "$old_sops" > "$tmp_sops"
+    python3 - "$tmp_sops" "${src}_secrets" "${dst}_secrets" "$src" "$dst" <<'PYEOF'
+import sys, yaml, pathlib, os
+p = pathlib.Path(sys.argv[1]); old_key, new_key = sys.argv[2], sys.argv[3]
+src_n, dst_n = sys.argv[4], sys.argv[5]
+d = yaml.safe_load(p.read_text()) or {}
+if old_key in d:
+    pkg_data = d.pop(old_key); d[new_key] = pkg_data
+    cp = pkg_data.get('config_params') or {}
+    prefix = src_n + '/'
+    new_cp = {}
+    for k, v in cp.items():
+        new_cp[(dst_n + '/' + k[len(prefix):]) if k.startswith(prefix) else k] = v
+    if new_cp: pkg_data['config_params'] = new_cp
+tmp = p.with_suffix('.tmp')
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, p)
+PYEOF
+    git -C "$GIT_ROOT" mv "infra/$dst/_config/${src}_secrets.sops.yaml" \
+                          "infra/$dst/_config/${dst}_secrets.sops.yaml"
+    sops --encrypt --output "$new_sops" "$tmp_sops"
+    rm "$tmp_sops"
+    echo "  secrets: ${src}_secrets.sops.yaml → ${dst}_secrets.sops.yaml (key re-encrypted)"
+  fi
+
+  # Phase 4: Patch internal .hcl deps
+  if [[ "$dry_run" == false ]]; then
+    python3 - "$dst_dir" "$src" "$dst" <<'PYEOF'
+import sys, pathlib
+dst_dir = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+old_s, new_s = f"infra/{src_n}/", f"infra/{dst_n}/"
+count = 0
+for hcl in dst_dir.rglob("*.hcl"):
+    if ".terragrunt-cache" in str(hcl): continue
+    txt = hcl.read_text()
+    if old_s in txt:
+        hcl.write_text(txt.replace(old_s, new_s)); count += 1
+print(f"  internal deps: patched {count} .hcl file(s)")
+PYEOF
+  fi
+
+  # Phase 5: Scan for external dep warnings
+  python3 - "$INFRA_DIR" "$src" "$dst" <<'PYEOF'
+import sys, pathlib
+infra_dir = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+old_prefix = f"infra/{src_n}/"
+warnings = []
+for hcl in infra_dir.rglob("*.hcl"):
+    rel = str(hcl.relative_to(infra_dir))
+    if ".terragrunt-cache" in rel or rel.startswith(f"{dst_n}/"): continue
+    for i, ln in enumerate(hcl.read_text().splitlines(), 1):
+        if old_prefix in ln:
+            warnings.append(f"  {rel}:{i}: {ln.strip()}")
+if warnings:
+    print(f"\nWARNING: {len(warnings)} external reference(s) to infra/{src_n}/ need manual update:")
+    for w in warnings: print(w)
+PYEOF
+
+  # Phase 6: GCS state
+  if [[ "$skip_state" == false ]]; then
+    _migrate_pkg_gcs_state "$src" "$dst" "$dry_run"
+  else
+    if [[ "$dry_run" == false ]] && _gcs_state_exists_for_pkg "$src"; then
+      local warn_bucket; warn_bucket=$(_gcs_bucket)
+      echo "WARNING: --skip-state was passed but GCS state exists under $src/." >&2
+      echo "         The package is now renamed to '$dst' but state remains at gs://$warn_bucket/$src/" >&2
+      echo "         It will be ORPHANED (unreachable). Migrate manually:" >&2
+      echo "           gsutil -m cp -r gs://$warn_bucket/$src/ gs://$warn_bucket/$dst/" >&2
+      echo "           gsutil -m rm -r gs://$warn_bucket/$src/" >&2
+    else
+      echo "  GCS state: skipped (--skip-state)"
+    fi
+  fi
+
+  # Phase 7: framework_packages.yaml
+  if [[ "$dry_run" == false ]]; then
+    python3 - "$FRAMEWORK_PKGS_CFG" "$src" "$dst" <<'PYEOF'
+import yaml, sys, pathlib, os
+cfg = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+d = yaml.safe_load(cfg.read_text()) or {}
+pkgs = d.get("framework_packages", [])
+for p in pkgs:
+    if p.get("name") == src_n: p["name"] = dst_n; break
+d["framework_packages"] = pkgs
+tmp = cfg.with_suffix(".tmp")
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg)
+print(f"  framework_packages.yaml: '{src_n}' → '{dst_n}'")
+PYEOF
+  fi
+
+  echo "==> rename complete: $src → $dst"
+}
+
+_cmd_copy() {
+  local src="${1:-}" dst="${2:-}"
+  shift 2 || true
+  local dry_run=false state_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    dry_run=true ;;
+      --skip-state) state_flag="skip" ;;
+      --with-state) state_flag="with" ;;
+      *) echo "ERROR: unknown option: $1" >&2; exit 1 ;;
+    esac; shift
+  done
+  if [[ -z "$src" || -z "$dst" ]]; then
+    echo "Usage: pkg-mgr copy <src-pkg> <dst-pkg> [--dry-run] --skip-state|--with-state" >&2; exit 1
+  fi
+  if [[ "$dry_run" == false && -z "$state_flag" ]]; then
+    echo "ERROR: copy requires --skip-state or --with-state" >&2
+    echo "  --skip-state : copy filesystem only; new package starts with no deployed state" >&2
+    echo "  --with-state : also copy GCS Terraform state blobs (two packages share state)" >&2
+    exit 1
+  fi
+  _assert_pkg_name "$dst"
+
+  local src_dir="$INFRA_DIR/$src" dst_dir="$INFRA_DIR/$dst"
+
+  # ---- Imported package (symlink) ----
+  if [[ -L "$src_dir" ]]; then
+    [[ -e "$dst_dir" ]] && { echo "ERROR: infra/$dst already exists" >&2; exit 1; }
+    local target; target=$(readlink "$src_dir")
+    if [[ "$dry_run" == true ]]; then
+      echo "  [dry-run] create symlink: infra/$dst → $target"
+      return 0
+    fi
+    ln -s "$target" "$dst_dir"; echo "  symlink: infra/$dst → $target"
+    python3 - "$FRAMEWORK_PKGS_CFG" "$src" "$dst" <<'PYEOF'
+import yaml, sys, pathlib, os, copy
+cfg = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+d = yaml.safe_load(cfg.read_text()) or {}
+pkgs = d.get("framework_packages", [])
+src_entry = next((copy.deepcopy(p) for p in pkgs if p.get("name") == src_n), None)
+if src_entry:
+    src_entry["name"] = dst_n; pkgs.append(src_entry)
+d["framework_packages"] = pkgs
+tmp = cfg.with_suffix(".tmp")
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg)
+print(f"  framework_packages.yaml: added '{dst_n}'")
+PYEOF
+    echo "==> copy complete (imported): $src → $dst"
+    return 0
+  fi
+
+  # ---- Local package ----
+  [[ ! -d "$src_dir" ]] && { echo "ERROR: infra/$src does not exist" >&2; exit 1; }
+  [[ -e "$dst_dir" ]] && { echo "ERROR: infra/$dst already exists" >&2; exit 1; }
+
+  echo "==> pkg-mgr copy $src → $dst"
+
+  # Phase 1: Filesystem copy
+  if [[ "$dry_run" == true ]]; then
+    echo "  [dry-run] cp -r infra/$src infra/$dst (then delete .terragrunt-cache/)"
+  else
+    cp -r "$src_dir" "$dst_dir"
+    find "$dst_dir" -type d -name ".terragrunt-cache" -exec rm -rf {} + 2>/dev/null || true
+    git -C "$GIT_ROOT" add "infra/$dst"
+    echo "  filesystem: copied infra/$src → infra/$dst"
+  fi
+
+  # Phase 2: Config file rename in dst
+  local old_cfg="$dst_dir/_config/${src}.yaml"
+  local new_cfg="$dst_dir/_config/${dst}.yaml"
+  if [[ "$dry_run" == true ]]; then
+    [[ -f "$old_cfg" ]] && echo "  [dry-run] rename _config/${src}.yaml → _config/${dst}.yaml + rename key"
+  elif [[ -f "$old_cfg" ]]; then
+    mv "$old_cfg" "$new_cfg"
+    git -C "$GIT_ROOT" add "infra/$dst/_config/${dst}.yaml"
+    _rename_pkg_yaml_keys "$new_cfg" "$src" "$dst"
+    echo "  config YAML: ${src}.yaml → ${dst}.yaml (key renamed)"
+  fi
+
+  # Phase 3: SOPS secrets copy + rename
+  local old_sops="$dst_dir/_config/${src}_secrets.sops.yaml"
+  local new_sops="$dst_dir/_config/${dst}_secrets.sops.yaml"
+  if [[ "$dry_run" == true ]]; then
+    [[ -f "$old_sops" ]] && echo "  [dry-run] copy + re-key ${src}_secrets.sops.yaml → ${dst}_secrets.sops.yaml"
+  elif [[ -f "$old_sops" ]]; then
+    local tmp_sops; tmp_sops=$(mktemp /tmp/pkg-mgr-sops-XXXXXX.yaml)
+    sops --decrypt "$old_sops" > "$tmp_sops"
+    python3 - "$tmp_sops" "${src}_secrets" "${dst}_secrets" "$src" "$dst" <<'PYEOF'
+import sys, yaml, pathlib, os
+p = pathlib.Path(sys.argv[1]); old_key, new_key = sys.argv[2], sys.argv[3]
+src_n, dst_n = sys.argv[4], sys.argv[5]
+d = yaml.safe_load(p.read_text()) or {}
+if old_key in d:
+    pkg_data = d.pop(old_key); d[new_key] = pkg_data
+    cp = pkg_data.get('config_params') or {}
+    prefix = src_n + '/'
+    new_cp = {}
+    for k, v in cp.items():
+        new_cp[(dst_n + '/' + k[len(prefix):]) if k.startswith(prefix) else k] = v
+    if new_cp: pkg_data['config_params'] = new_cp
+tmp = p.with_suffix('.tmp')
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, p)
+PYEOF
+    rm "$old_sops"
+    sops --encrypt --output "$new_sops" "$tmp_sops"
+    rm "$tmp_sops"
+    git -C "$GIT_ROOT" add "infra/$dst/_config/${dst}_secrets.sops.yaml"
+    echo "  secrets: ${dst}_secrets.sops.yaml (re-keyed copy)"
+  fi
+
+  # Phase 4: Patch internal .hcl deps in dst tree
+  if [[ "$dry_run" == false ]]; then
+    python3 - "$dst_dir" "$src" "$dst" <<'PYEOF'
+import sys, pathlib
+dst_dir = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+old_s, new_s = f"infra/{src_n}/", f"infra/{dst_n}/"
+count = 0
+for hcl in dst_dir.rglob("*.hcl"):
+    if ".terragrunt-cache" in str(hcl): continue
+    txt = hcl.read_text()
+    if old_s in txt:
+        hcl.write_text(txt.replace(old_s, new_s)); count += 1
+print(f"  internal deps: patched {count} .hcl file(s)")
+PYEOF
+  fi
+
+  # Phase 5: GCS state (caller must specify --skip-state or --with-state)
+  if [[ "$state_flag" == "with" ]]; then
+    [[ "$dry_run" == false ]] && _check_gcs_locks_for_pkg "$src"
+    _migrate_pkg_gcs_state "$src" "$dst" "$dry_run" "copy"
+  else
+    echo "  GCS state: skipped (--skip-state)"
+  fi
+
+  # Phase 6: framework_packages.yaml
+  if [[ "$dry_run" == false ]]; then
+    python3 - "$FRAMEWORK_PKGS_CFG" "$src" "$dst" <<'PYEOF'
+import yaml, sys, pathlib, os, copy as _copy
+cfg = pathlib.Path(sys.argv[1]); src_n, dst_n = sys.argv[2], sys.argv[3]
+d = yaml.safe_load(cfg.read_text()) or {}
+pkgs = d.get("framework_packages", [])
+src_entry = next((_copy.deepcopy(p) for p in pkgs if p.get("name") == src_n),
+                 {"name": src_n, "package_type": "embedded", "exportable": False})
+src_entry["name"] = dst_n
+pkgs.append(src_entry)
+d["framework_packages"] = pkgs
+tmp = cfg.with_suffix(".tmp")
+tmp.write_text(yaml.dump(d, allow_unicode=True, default_flow_style=False))
+os.replace(tmp, cfg)
+print(f"  framework_packages.yaml: added '{dst_n}'")
+PYEOF
+  fi
+
+  echo "==> copy complete: $src → $dst"
+  echo "    NOTE: config_params values were copied verbatim — update IPs, names, etc. before deploying"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+_usage() {
+  cat <<'USAGE'
+Usage: pkg-mgr <flag> [args]
+
+  -S, --status                  Package status table
+  -V, --status-verbose          Package status with full resolved paths
+  -s, --sync                    Apply current framework_packages.yaml state
+  -c, --clean                   Remove dangling symlinks and orphaned clones
+  -C, --clean-all               Remove all ext-package symlinks and clones
+  -A, --add-repo <url> [name]   Register and clone a package repository
+      --remove-repo <name>      Deregister a repo and remove its packages
+  -i, --import <repo> <pkg>     Import one package from a registered repo
+                                Options: --git-ref <ref>
+  -r, --remove <pkg>            Remove one imported package
+  -l, --list-remote <repo>      List public packages in a registered repo
+      --check <repo> <pkg>      Run collision check (exit 0=clean, 1=collision)
+      --rename <src> <dst>      Rename a package (filesystem + config + SOPS + state)
+                                Options: --dry-run, --skip-state
+      --copy <src> <dst>        Copy a package (--skip-state or --with-state required)
+                                Options: --dry-run, --skip-state, --with-state
+USAGE
+}
+
+CMD=""
+declare -a PASS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -S|--status)         CMD="status";         shift ;;
+    -V|--status-verbose) CMD="status-verbose"; shift ;;
+    -s|--sync)           CMD="sync";           shift ;;
+    -c|--clean)          CMD="clean";          shift ;;
+    -C|--clean-all)      CMD="clean"; PASS=(--all); shift ;;
+    -A|--add-repo)       CMD="add-repo";       shift ;;
+    --remove-repo)       CMD="remove-repo";    shift ;;
+    -i|--import)         CMD="import";         shift ;;
+    -r|--remove)         CMD="remove";         shift ;;
+    -l|--list-remote)    CMD="list-remote";    shift ;;
+    --check)             CMD="check";          shift ;;
+    --rename)            CMD="rename";         shift ;;
+    --copy)              CMD="copy";           shift ;;
+    --)                  shift; PASS+=("$@"); break ;;
+    *)                   PASS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -z "$CMD" ]]; then
+  _usage
+  exit 0
+fi
+
+_maybe_regenerate_config() {
+  local config_mgr_generate="$GIT_ROOT/infra/_framework-pkg/_framework/_config-mgr/generate"
+  if [[ -x "$config_mgr_generate" ]]; then
+    "$config_mgr_generate" || true
+  fi
+}
+
+case "$CMD" in
+  status)         _cmd_status ;;
+  status-verbose) _cmd_status --verbose ;;
+  sync)           _cmd_sync;                        _maybe_regenerate_config ;;
+  clean)          _cmd_clean "${PASS[@]}" ;;
+  add-repo)       _cmd_add_repo "${PASS[@]}" ;;
+  remove-repo)    _cmd_remove_repo "${PASS[@]}" ;;
+  import)         _cmd_import "${PASS[@]}";          _maybe_regenerate_config ;;
+  remove)         _cmd_remove "${PASS[@]}";          _maybe_regenerate_config ;;
+  list-remote)    _cmd_list_remote "${PASS[@]}" ;;
+  check)          _cmd_check "${PASS[@]}" ;;
+  rename)         _cmd_rename "${PASS[@]}";          _maybe_regenerate_config ;;
+  copy)           _cmd_copy "${PASS[@]}";            _maybe_regenerate_config ;;
+  *) echo "ERROR: unknown command: $CMD" >&2; exit 1 ;;
+esac

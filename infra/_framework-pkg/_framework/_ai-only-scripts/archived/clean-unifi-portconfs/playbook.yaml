@@ -1,0 +1,94 @@
+---
+# Detect and delete duplicate UniFi portconfs (port profiles).
+#
+# Across deployment cycles, Terraform create/destroy leaves behind orphaned
+# portconf entries with the same display name as the current managed profile.
+# This playbook finds portconfs that share a name, identifies which are
+# referenced by switch port_overrides, and deletes the unreferenced duplicates.
+#
+# Pass --extra-vars "fix=true" to apply deletions (default: dry-run).
+
+- name: Clean duplicate UniFi portconfs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    script_dir: "{{ playbook_dir }}"
+    tmp_config: "/tmp/clean-unifi-portconfs-config.json"
+    fix: false
+    also_orphans: false
+
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Discover UniFi provider root path (has _provider_unifi_api_url)
+      ansible.builtin.set_fact:
+        _unifi_root_path: >-
+          {{
+            (_tg_providers.unifi.config_params | default({}) | dict2items
+            | selectattr('value._provider_unifi_api_url', 'defined')
+            | map(attribute='key') | list | first) | default('')
+          }}
+
+    - name: Capture UniFi base config, secrets, and current port profile config
+      ansible.builtin.set_fact:
+        _unifi_base_cfg: "{{ _unifi_root_path | ancestor_merge(_all_config_params) }}"
+        _unifi_secrets: >-
+          {{
+            (_tg_providers_secrets.unifi.config_params | default({})).get(_unifi_root_path, {}) | default({})
+          }}
+        _unifi_profile_cfg: >-
+          {{
+            (_tg_providers.unifi.config_params | default({}) | dict2items
+            | selectattr('key', 'match', '.*/port-profile$')
+            | rejectattr('key', 'match', '.*/examples/.*')
+            | map(attribute='value') | list | first) | default({})
+          }}
+
+    - name: Assert UniFi credentials are present
+      ansible.builtin.fail:
+        msg: >-
+          UniFi credentials not found at {{ _unifi_root_path }} in secrets YAML.
+          Check infra/unifi-pkg/_config/unifi-pkg_secrets.sops.yaml.
+      when: >-
+        _unifi_secrets._provider_unifi_username is not defined or
+        _unifi_secrets._provider_unifi_password is not defined
+
+    - name: Write script config to temp file
+      ansible.builtin.copy:
+        content: >-
+          {{
+            {
+              'unifi_url': _unifi_base_cfg._provider_unifi_api_url,
+              'managed_profile_names': (
+                _unifi_profile_cfg.port_profiles | default({}) | dict2items
+                | map(attribute='value') | map(attribute='name') | list
+              )
+            } | to_nice_json
+          }}
+        dest: "{{ tmp_config }}"
+        mode: "0600"
+
+    - name: Run clean-portconfs script
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ script_dir }}/scripts/clean-portconfs.py
+          {{ tmp_config }}
+          {{ '--fix' if (fix | bool) else '' }}
+          {{ '--also-orphans' if (also_orphans | bool) else '' }}
+      environment:
+        UNIFI_USERNAME: "{{ _unifi_secrets._provider_unifi_username }}"
+        UNIFI_PASSWORD: "{{ _unifi_secrets._provider_unifi_password }}"
+      register: _script_result
+
+    - name: Show script output
+      ansible.builtin.debug:
+        msg: "{{ _script_result.stdout_lines }}"
+
+    - name: Clean up temp config file
+      ansible.builtin.file:
+        path: "{{ tmp_config }}"
+        state: absent

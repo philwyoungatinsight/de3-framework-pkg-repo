@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# write-exit-status/run  <unit_path>  <rel_path_full>
+#
+# Called by root.hcl after_hook "exit_status_write" on every apply/destroy.
+# Reads the marker file left by after_hook "exit_status_mark_ok" to determine
+# ok vs fail, then writes a YAML status file to $_DYNAMIC_DIR/unit-status/.
+#
+# File naming (all in one directory, distinguished by prefix):
+#   exit-<rel_path_full>.yaml  — final exit status (consumed by GUI Tier 1)
+#   maas-<rel_path_full>.yaml  — MaaS intermediate status (written by MaaS
+#                                 scripts, cleaned up here on apply completion)
+#   .ok-<rel_path_full>        — success marker (written by exit_status_mark_ok,
+#                                 read and deleted by this script)
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/set_env.sh"
+
+UNIT_PATH="$1"
+REL_FULL="$2"
+STATUS_DIR="${_DYNAMIC_DIR}/unit-status"
+MARKER="${STATUS_DIR}/.ok-${REL_FULL}"
+
+mkdir -p "$STATUS_DIR"
+
+if [ -f "$MARKER" ]; then
+  STATUS="ok"
+  rm -f "$MARKER"
+else
+  STATUS="fail"
+fi
+
+FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Clean up any stale MaaS intermediate status for this unit now that the
+# apply is done — prevents the GUI from showing stale maas_phase after completion.
+rm -f "${STATUS_DIR}/maas-${REL_FULL}.yaml"
+
+# Atomic write: temp file in same directory + rename
+TMP=$(mktemp "${STATUS_DIR}/.XXXXXX")
+cat > "$TMP" <<EOF
+unit_path: ${UNIT_PATH}
+status: ${STATUS}
+finished_at: ${FINISHED_AT}
+EOF
+mv -f "$TMP" "${STATUS_DIR}/exit-${REL_FULL}.yaml"
+
+# Write unit status to GCS (fire-and-forget; never blocks apply).
+source "${_UTILITIES_DIR}/bash/gcs-status.sh"
+EXIT_CODE=0
+[[ "$STATUS" == "fail" ]] && EXIT_CODE=1
+gcs_write_unit_status "$UNIT_PATH" "$STATUS" "$EXIT_CODE"

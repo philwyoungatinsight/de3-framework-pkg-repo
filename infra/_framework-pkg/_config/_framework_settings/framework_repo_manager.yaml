@@ -1,0 +1,157 @@
+framework_repo_manager:
+  # This config file tells the framework repo manager how to create new framework repos.
+  # This can pull packages from multiple repos, and produce one or more repos.
+  # Each repo can contain any combination of embedded packages and external dependencies.
+
+  # Base directory under $HOME where target repos are built.
+  # 'git' → $HOME/git/<name>/
+  # '.' → $HOME/<name>/
+  framework_repo_dir: 'git/de3-generated-framework-repos'
+
+
+  # Default source repo parameters looked up by name.
+  # Each entry supplies the url and ref used when a per-repo source_repo block
+  # references only the name without explicit url/ref.
+  source_repo_defaults:
+    - name: de3-runner
+      url: https://github.com/philwyoungatinsight/de3-runner.git
+      ref: main          # default ref when not overridden per target
+
+  # Package automatically prepended to every repo's framework_packages list.
+  # Provides the top-level files (Makefile, set_env.sh, run, root.hcl, etc.)
+  # for each built repo. Override in your deployment _framework_settings/ if
+  # your framework lives in a different repo.
+  #
+  #framework_package_template:
+  #  name: _framework-pkg
+  #  package_type: external
+  #  exportable: true
+  #  repo: de3-runner
+  #  source: https://github.com/your-org/de3-runner.git
+  #  git_ref: main
+
+  # Settings written into every generated repo's _framework_settings/ directory.
+  # Each top-level key <foo> is written as <foo>.yaml with {<foo>: <value>}.
+  # Applied after copying source _framework_settings/, so these take precedence.
+  # Use this to share settings (e.g. the same GCS backend) across all generated
+  # repos without repeating them per-repo entry.
+  #
+  #framework_settings_template:
+  #  framework_backend:
+  #    type: gcs
+  #    config:
+  #      bucket: <your-state-bucket>
+  #      project: <your-gcp-project>
+  #      location: US-CENTRAL1
+
+  # List of named SOPS templates written as .sops.yaml at the git root of generated repos.
+  # Each entry has a "name:" field; repos reference a template via "sops-template: <name>".
+  # The "default" entry is used when sops-template is absent from a repo entry.
+  # Content is not secret (PGP fingerprints are public) — lives in plaintext config.
+  #
+#  framework_settings_sops_templates:
+#    - name: default
+#      stores:
+#        yaml:
+#          indent: 2
+#      creation_rules:
+#        ################################################################################
+#        # Package-specific overrides — must come BEFORE the general rule below.
+#        # SOPS uses the first matching rule; more-specific path_regex goes first.
+#        ################################################################################
+#        # Example: use a different set of keys to encrypt sops files for a particular package.
+#        - path_regex: '.*infra/unifi-pkg/_config/.*\.sops\.yaml$'
+#          pgp: >-
+#            <fingerprint1>,
+#            <fingerprint2>
+#        ################################################################################
+#        # Default encryption keys for all packages
+#        # (infra/<pkg>/_config/<pkg>_secrets.sops.yaml)
+#        ################################################################################
+#        - path_regex: '.*infra/[^/]+/_config/.*\.sops\.yaml$'
+#          pgp: >-
+#            <fingerprint1>,
+#            <fingerprint2>
+
+
+  # Naming rules enforced during fw-repo-mgr build/validate.
+  # Deployment repos may override these in their tier-2 framework_repo_manager.yaml.
+  # Multiple rules with the same name use OR logic (any match is valid).
+  # Supported rule names:
+  #   repo_names_must_be_unique                    value: true
+  #   repo_names_must_begin_with                   value: <prefix>   (multiple = OR)
+  #   repo_names_must_end_with                     value: <suffix>   (multiple = OR)
+  #   repo_names_must_not_contain_special_chars    value: true
+  #   package_names_must_be_unique                 value: true
+  #   package_names_must_be_valid_identifiers      value: true   (enforces -pkg suffix)
+  #   package_names_must_not_contain_special_chars value: true
+  framework_package_naming_rules:
+    - name: repo_names_must_be_unique
+      value: true
+    - name: repo_names_must_begin_with
+      value: de3-
+    - name: repo_names_must_end_with
+      value: -repo
+    - name: repo_names_must_not_contain_special_chars
+      value: true
+    - name: package_names_must_be_unique
+      value: true
+    - name: package_names_must_be_valid_identifiers
+      value: true
+    - name: package_names_must_not_contain_special_chars
+      value: true
+
+
+  # Target repos to build.
+  #
+  # local_only: true — build the repo on local disk but skip all remote pushes.
+  #   Use this to validate the generated repo structure before creating the real
+  #   GitHub/GitLab repos. The git-remotes block is still read (shown in `status`)
+  #   but no push is made and no remotes are added to the local git repo.
+  #   Once you are happy with the local result, remove the flag and re-run
+  #   `fw-repo-mgr build <name>` to push.
+  #
+  # Example:
+  #- name: de3-my-new-pkg-repo
+  #  local_only: true          # remove once you've validated the local repo
+  #  source_repo:
+  #    name: de3-runner
+  #  new_repo_config:
+  #    git-remotes:
+  #      - name: origin
+  #        git-source: https://github.com/you/de3-my-new-pkg-repo.git
+  #        git-ref: main
+  #      - name: gitlab
+  #        git-source: git@gitlab.com:you/de3-my-new-pkg-repo.git
+  #        git-ref: main
+  #  framework_packages:
+  #    - name: my-new-pkg
+  #      package_type: embedded
+  #      exportable: true
+  #      is_main_package: true
+  #
+  # ⚠️  EVERY ENTRY HERE MUST BE A REAL REPO — NO PLACEHOLDER EXAMPLES.
+  # The fw-repos visualizer treats all uncommented entries as existing repos:
+  # it will attempt to clone them and draw them in the diagram. Comment out
+  # any entry that does not yet have a real upstream URL.
+  framework_repos: []
+
+  # Deployment repos belong in the deployment repo's own framework_repo_manager.yaml
+  # (Tier 2), not here. Declaring a deployment repo in this template causes every
+  # fw-repos scan to clone that repo's remote and read its config, which may be stale.
+  #
+  # Example — declare your deployment repo in your deployment repo's config:
+  #- name: de3-my-deployment-repo
+  #  local_only: true          # remove once validated and repos are created
+  #  source_repo:
+  #    name: de3-runner
+  #  new_repo_config:
+  #    git-remotes:
+  #      - name: origin
+  #        git-source: https://github.com/you/de3-my-deployment-repo.git
+  #        git-ref: main
+  #  framework_packages:
+  #    - name: my-deployment-pkg
+  #      package_type: embedded
+  #      exportable: false
+  #      is_main_package: true

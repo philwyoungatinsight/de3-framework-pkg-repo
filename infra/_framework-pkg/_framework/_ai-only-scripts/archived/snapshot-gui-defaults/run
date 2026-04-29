@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+source "${GIT_ROOT}/set_env.sh"
+
+STATE_DIR="${GIT_ROOT}/infra/de3-gui-pkg/_application/de3-gui/state"
+CURRENT="${STATE_DIR}/current.yaml"
+DEFAULTS="${STATE_DIR}/defaults.yaml"
+
+if [[ ! -f "${CURRENT}" ]]; then
+  echo "ERROR: ${CURRENT} does not exist — start the GUI at least once first." >&2
+  exit 1
+fi
+
+python3 - "${CURRENT}" "${DEFAULTS}" <<'PYEOF'
+import sys, yaml
+from pathlib import Path
+
+current_path  = Path(sys.argv[1])
+defaults_path = Path(sys.argv[2])
+
+TRANSIENT = {
+    "config_data_search_query",
+    "unit_file_search_query",
+    "explorer_search",
+    "unit_params_search",
+    "selected_node_path",
+}
+
+data = yaml.safe_load(current_path.read_text()) or {}
+menu = data.get("current", {}).get("menu", {})
+for key in TRANSIENT:
+    menu[key] = ""
+data["current"]["menu"] = menu
+
+defaults_path.write_text(yaml.dump(data, allow_unicode=True, default_flow_style=False))
+print(f"Wrote {defaults_path}")
+PYEOF

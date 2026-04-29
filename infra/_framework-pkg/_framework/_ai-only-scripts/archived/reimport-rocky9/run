@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Re-import the Rocky Linux 9 custom boot resource into MaaS.
+# Run this when the rocky-9 MaaS deployment fails with 'curtin command install'
+# and the existing image needs to be replaced with a fresh, fully-customized one.
+#
+# Pre-requisite: delete the rocky-9 boot resource first:
+#   maas admin boot-resource delete <id>
+# Then run: ./run
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+export GIT_ROOT
+
+# shellcheck source=/dev/null
+. "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+_activate_ansible_locally "$SCRIPT_DIR"
+
+INVENTORY_FILE="${_DYNAMIC_DIR}/ansible/inventory/hosts.yml"
+
+if [ ! -f "${INVENTORY_FILE}" ]; then
+    echo "Inventory not found — generating..."
+    "$_GENERATE_INVENTORY" --build
+fi
+
+ansible-playbook \
+  -i "${INVENTORY_FILE}" \
+  -e "ansible_python_interpreter=/usr/bin/python3" \
+  -e "ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'" \
+  "${SCRIPT_DIR}/playbook.yaml" \
+  "$@"

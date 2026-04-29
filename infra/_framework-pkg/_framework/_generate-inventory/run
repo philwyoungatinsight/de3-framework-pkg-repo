@@ -1,0 +1,172 @@
+#!/bin/bash
+
+################################################################################
+# Boiler plate
+################################################################################
+
+# uncomment this to for debugging
+#set -x
+
+# Aggressively catch and report errors
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+# Set Config variables
+. $(git rev-parse --show-toplevel)/set_env.sh
+
+# Path to this script
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Utility functions
+. $_UTILITIES_DIR/bash/init.sh
+
+################################################################################
+# Use our own Python (not the OS)
+################################################################################
+
+# Use this to create the Python virtual environment
+export PYTHON_VERSION='python3.12'
+
+setup_python() {
+    # Create/Use a Python Virtual Environment just for this task directory
+    VENV_PARENT_DIR="$SCRIPT_DIR"
+    # This only needs python
+    _activate_python_locally "$VENV_PARENT_DIR"
+}
+
+################################################################################
+# Functions
+################################################################################
+
+function show_usage()
+{
+    printf "Usage: $0 <command>\n"
+    cat <<EOF
+    -b|--build                 Generate the Ansible inventory from Terraform state
+    -t|--test                  Generate inventory without SSH reachability check
+    -E|--exclude-unreachable   Generate inventory; exclude (warn) unreachable hosts
+    -d|--deps                  Install Python requirements only
+    -c|--clean                 Remove the generated inventory file
+    -C|--clean-all             Remove the inventory file and the Python virtual environment
+    -s|--status                Show the current inventory file
+    -h|--help                  Show this help
+
+    Example:
+      $0 -b
+      $0 -c -b
+EOF
+  exit 1
+}
+
+if [[ $# -lt 1 ]]; then
+    show_usage $@
+fi
+
+################################################################################
+# Boiler plate make targets
+################################################################################
+
+function build() {
+    echo "build"
+    setup_python
+    local wave_arg=()
+    [[ -n "${_INVENTORY_WAVE:-}" ]] && wave_arg=(--wave "${_INVENTORY_WAVE}")
+    python3 "${SCRIPT_DIR}/generate_ansible_inventory.py" --fail-on-unreachable "${wave_arg[@]}"
+}
+
+function exclude_unreachable() {
+    echo "exclude_unreachable"
+    setup_python
+    local wave_arg=()
+    [[ -n "${_INVENTORY_WAVE:-}" ]] && wave_arg=(--wave "${_INVENTORY_WAVE}")
+    python3 "${SCRIPT_DIR}/generate_ansible_inventory.py" --exclude-unreachable "${wave_arg[@]}"
+}
+
+function clean() {
+    echo "clean"
+    local output_file="${_DYNAMIC_DIR}/hosts.yml"
+    if [ -f "$output_file" ]; then
+        rm "$output_file"
+        echo "Removed $output_file"
+    else
+        echo "Nothing to clean"
+    fi
+}
+
+function clean_all() {
+    echo "clean_all"
+    clean
+    rm -rf "${SCRIPT_DIR}/.venv"
+}
+
+function test_app() {
+    echo "test"
+    setup_python
+    python3 "${SCRIPT_DIR}/generate_ansible_inventory.py" --no-ssh-check
+}
+
+function show_status() {
+    echo "status"
+    local output_file="${_DYNAMIC_DIR}/hosts.yml"
+    if ! [ -f "$output_file" ]; then
+        echo "No inventory file found at $output_file"
+        cd "${SCRIPT_DIR}"
+        ./run --build
+    fi
+    echo "Inventory file: $output_file"
+    cat "$output_file"
+}
+
+function deps() {
+    echo "deps"
+    setup_python
+}
+
+################################################################################
+# Process run arguments
+################################################################################
+while [[ $# -gt 0 ]]; do
+  key="$1"
+
+  case $key in
+    -c|--clean)
+        shift
+        clean
+        ;;
+    -C|--clean-all)
+        shift
+        clean_all
+        ;;
+    -b|--build)
+        shift
+        build
+        ;;
+    -E|--exclude-unreachable)
+        shift
+        exclude_unreachable
+        ;;
+    -s|--status)
+        shift
+        show_status
+        ;;
+    -t|--test)
+        shift
+        test_app
+        ;;
+    -d|--deps)
+        shift
+        deps
+        ;;
+    -h|--help)
+        show_usage
+      ;;
+    *)
+      shift # ignore
+      ;;
+  esac
+done

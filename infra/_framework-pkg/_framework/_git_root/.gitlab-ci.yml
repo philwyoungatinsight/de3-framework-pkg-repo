@@ -1,0 +1,5 @@
+# CI/CD pipeline intentionally disabled — no pipeline configured yet.
+# Replace this file when ready to add stages.
+workflow:
+  rules:
+    - when: never

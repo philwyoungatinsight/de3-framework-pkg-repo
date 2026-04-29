@@ -1,0 +1,49 @@
+---
+# Apply iptables rules to block MaaS RPC ports (5250-5253) on the provisioning
+# NIC IP (10.0.12.2). This forces the rack controller to use the management NIC
+# (10.0.10.11) for rack→region communication, isolating it from PXE/DHCP traffic.
+#
+# Run once against the live server; the same logic is baked into
+# configure-maas-networking.yaml for future rebuilds.
+
+- name: Apply RPC isolation iptables rules on MaaS server
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    # Provisioning NIC IPs to block RPC ports on — matches rack_ip in managed_networks
+    provisioning_rack_ips:
+      - "10.0.12.2"
+  tasks:
+    - name: Block MaaS RPC ports on provisioning NIC IPs
+      ansible.builtin.iptables:
+        chain: INPUT
+        destination: "{{ item }}"
+        protocol: tcp
+        destination_port: "5250:5253"
+        jump: DROP
+        state: present
+      loop: "{{ provisioning_rack_ips }}"
+      loop_control:
+        label: "DROP TCP 5250-5253 → {{ item }}"
+      register: _rpc_block_rules
+
+    - name: Persist iptables rules
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p /etc/iptables
+          iptables-save > /etc/iptables/rules.v4
+          if [ ! -f /etc/network/if-up.d/iptables ]; then
+            printf '#!/bin/sh\niptables-restore < /etc/iptables/rules.v4\n' > /etc/network/if-up.d/iptables
+            chmod +x /etc/network/if-up.d/iptables
+          fi
+      changed_when: false
+
+    - name: Verify INPUT chain
+      ansible.builtin.command: iptables -L INPUT -n --line-numbers
+      register: _iptables_check
+      changed_when: false
+
+    - name: Show INPUT chain
+      ansible.builtin.debug:
+        msg: "{{ _iptables_check.stdout_lines }}"

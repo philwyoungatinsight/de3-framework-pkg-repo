@@ -1,0 +1,115 @@
+---
+# test-10g-connectivity — validates 10G switching throughput between Proxmox hosts
+# after CRS317 cabling and Proxmox bridge configuration are complete.
+#
+# What it tests:
+#   Play 1: Assign a temporary test IP on the 10G cloud bridge (VLAN 10).
+#   Play 2: Run iperf3 server on pve-1, client on ms01-01, report throughput.
+#   Play 3: Tear down the temporary IP.
+#
+# Expected results:
+#   VLAN 10 (cloud_public, vmbr1):    >= 9.0 Gbits/sec
+#
+# Note: VLAN 14 (storage) test is deferred — only 4 SFP cables available; storage
+# ports are not yet wired. Add storage test here when cables are installed.
+#
+# Prerequisites:
+#   - CRS317 cabling is complete (sfpplus1 uplink + cloud ports sfpplus2/4/6/8 wired)
+#   - Proxmox hosts have vmbr1 (cloud) bridge configured
+#     (run scripts/ai-only-scripts/configure-proxmox-10g-bridges first)
+#   - iperf3 installed: apt-get install -y iperf3
+#
+# Usage:
+#   ./run
+#   SERVER_HOST=10.0.10.115  CLIENT_HOST=10.0.10.116  ./run
+
+- name: Load config and prepare test parameters
+  hosts: localhost
+  gather_facts: false
+  vars:
+    server_host: "{{ lookup('env', 'SERVER_HOST') | default('10.0.10.115', true) }}"
+    client_host: "{{ lookup('env', 'CLIENT_HOST') | default('10.0.10.116', true) }}"
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    ssh_user: root
+    # Temporary IPs on the 10G cloud bridge for iperf3 (not used in production)
+    test_cloud_server_ip: "10.0.10.250"
+    test_cloud_client_ip: "10.0.10.251"
+    cloud_bridge: vmbr1
+    min_gbps: 9.0
+    duration_seconds: 10
+    iperf3_port_cloud: 5201
+
+  tasks:
+  - name: Install iperf3 on both hosts
+    ansible.builtin.shell: |
+      ssh {{ ssh_opts }} {{ ssh_user }}@{{ item }} \
+        "which iperf3 >/dev/null 2>&1 || apt-get install -y iperf3 >/dev/null 2>&1 && echo OK"
+    loop:
+      - "{{ server_host }}"
+      - "{{ client_host }}"
+    changed_when: false
+
+  # ─── Set up temporary test IPs ────────────────────────────────────────────
+  - name: Add temporary test IP on server (pve-1)
+    ansible.builtin.shell: |
+      ssh {{ ssh_opts }} {{ ssh_user }}@{{ server_host }} bash << 'EOF'
+      ip addr add {{ test_cloud_server_ip }}/24 dev {{ cloud_bridge }} 2>/dev/null || true
+      echo "Server test IP set"
+      EOF
+
+  - name: Add temporary test IP on client (ms01-01)
+    ansible.builtin.shell: |
+      ssh {{ ssh_opts }} {{ ssh_user }}@{{ client_host }} bash << 'EOF'
+      ip addr add {{ test_cloud_client_ip }}/24 dev {{ cloud_bridge }} 2>/dev/null || true
+      echo "Client test IP set"
+      EOF
+
+  # ─── VLAN 10 cloud_public test ────────────────────────────────────────────
+  - name: Start iperf3 server on pve-1 (cloud bridge)
+    ansible.builtin.shell: |
+      ssh {{ ssh_opts }} {{ ssh_user }}@{{ server_host }} \
+        "pkill iperf3 2>/dev/null; nohup iperf3 -s -B {{ test_cloud_server_ip }} -p {{ iperf3_port_cloud }} -D --logfile /tmp/iperf3-cloud.log && echo started"
+
+  - name: Wait for iperf3 server to be ready (cloud)
+    ansible.builtin.pause:
+      seconds: 2
+
+  - name: Run iperf3 client on ms01-01 → pve-1 (VLAN 10 cloud bridge)
+    ansible.builtin.shell: |
+      ssh {{ ssh_opts }} {{ ssh_user }}@{{ client_host }} \
+        "iperf3 -c {{ test_cloud_server_ip }} -B {{ test_cloud_client_ip }} \
+          -p {{ iperf3_port_cloud }} -t {{ duration_seconds }} --json"
+    register: cloud_result
+
+  - name: Report VLAN 10 (cloud_public) throughput
+    vars:
+      cloud_json: "{{ cloud_result.stdout | from_json }}"
+      bits_per_sec: "{{ cloud_json.end.sum_sent.bits_per_second | float }}"
+      gbps: "{{ (bits_per_sec | float / 1e9) | round(2) }}"
+    ansible.builtin.debug:
+      msg: >
+        VLAN 10 (cloud_public) throughput: {{ gbps }} Gbps
+        {{ '[PASS]' if (gbps | float) >= (min_gbps | float) else '[FAIL] expected >= ' + min_gbps | string + ' Gbps' }}
+
+  - name: Assert VLAN 10 throughput meets minimum
+    vars:
+      cloud_json: "{{ cloud_result.stdout | from_json }}"
+      gbps: "{{ (cloud_json.end.sum_sent.bits_per_second | float / 1e9) | round(2) }}"
+    ansible.builtin.assert:
+      that: "(gbps | float) >= (min_gbps | float)"
+      fail_msg: "VLAN 10 throughput {{ gbps }} Gbps is below minimum {{ min_gbps }} Gbps"
+      success_msg: "VLAN 10 throughput {{ gbps }} Gbps OK"
+
+  # ─── Cleanup ──────────────────────────────────────────────────────────────
+  - name: Remove temporary test IPs and kill iperf3 servers
+    ansible.builtin.shell: |
+      for HOST in {{ server_host }} {{ client_host }}; do
+        ssh {{ ssh_opts }} {{ ssh_user }}@$HOST bash << 'EOF'
+        pkill iperf3 2>/dev/null || true
+        ip addr del {{ test_cloud_server_ip }}/24 dev {{ cloud_bridge }} 2>/dev/null || true
+        ip addr del {{ test_cloud_client_ip }}/24 dev {{ cloud_bridge }} 2>/dev/null || true
+        echo "Cleaned $HOSTNAME"
+        EOF
+      done
+    when: true
+    changed_when: false

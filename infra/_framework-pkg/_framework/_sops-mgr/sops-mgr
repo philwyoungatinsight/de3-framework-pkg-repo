@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+sops-mgr — manage SOPS-encrypted secrets files across all packages.
+
+USAGE
+  sops-mgr -r|--re-encrypt [-d PATH]  re-encrypt *.sops.yaml with current .sops.yaml keys
+  sops-mgr -v|--verify     [-d PATH]  verify all *.sops.yaml files can be decrypted
+  -d|--infra-dir PATH                 scope search to PATH instead of $_INFRA_DIR
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+# ── environment ────────────────────────────────────────────────────────────────
+
+def _source_env() -> dict:
+    git_root = subprocess.check_output(
+        ['git', 'rev-parse', '--show-toplevel'], text=True
+    ).strip()
+    raw = subprocess.check_output(
+        ['bash', '-c', f'source {git_root}/set_env.sh && env -0'],
+        text=True,
+    )
+    env = {}
+    for item in raw.split('\0'):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            env[k] = v
+    return env
+
+
+ENV = _source_env()
+os.environ.update(ENV)
+
+INFRA_DIR = Path(ENV['_INFRA_DIR'])
+
+
+# ── file discovery ─────────────────────────────────────────────────────────────
+
+def _find_sops_files(infra_dir: Path | None = None) -> list[Path]:
+    """All *.sops.yaml under infra_dir (or INFRA_DIR), excluding .sops.yaml key-config files."""
+    root = infra_dir if infra_dir is not None else INFRA_DIR
+    return sorted(
+        f for f in root.rglob('*.sops.yaml')
+        if f.name != '.sops.yaml'
+    )
+
+
+# ── commands ───────────────────────────────────────────────────────────────────
+
+def cmd_re_encrypt(infra_dir: Path | None = None):
+    """Re-encrypt every secrets file using key recipients from the nearest .sops.yaml.
+
+    Uses `sops updatekeys` which never writes plaintext to disk.
+    """
+    files = _find_sops_files(infra_dir)
+    if not files:
+        print('sops-mgr: no *.sops.yaml files found', file=sys.stderr)
+        return
+
+    ok = 0
+    failed = 0
+    for f in files:
+        print(f'sops-mgr: re-encrypting {f}', file=sys.stderr)
+        result = subprocess.run(
+            ['sops', 'updatekeys', '--yes', str(f)],
+            env=ENV,
+        )
+        if result.returncode == 0:
+            ok += 1
+        else:
+            print(f'sops-mgr: ERROR: re-encrypt failed for {f}', file=sys.stderr)
+            failed += 1
+
+    print(f'\nsops-mgr: re-encrypt complete — {ok} ok, {failed} failed', file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+def cmd_verify(infra_dir: Path | None = None):
+    """Verify every secrets file can be decrypted.
+
+    Decrypted output is discarded — plaintext is never written to disk.
+    If a file has no SOPS metadata, interactively offers to encrypt it.
+    """
+    files = _find_sops_files(infra_dir)
+    if not files:
+        print('sops-mgr: no *.sops.yaml files found', file=sys.stderr)
+        return
+
+    ok = 0
+    failed = 0
+    for f in files:
+        result = subprocess.run(
+            ['sops', '--decrypt', str(f)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=ENV,
+        )
+        if result.returncode == 0:
+            print(f'sops-mgr: ok   {f}', file=sys.stderr)
+            ok += 1
+            continue
+
+        stderr = result.stderr
+        if 'sops metadata not found' in stderr or 'expected key' in stderr:
+            print(f'sops-mgr: UNENCRYPTED {f} (no SOPS metadata)', file=sys.stderr)
+            try:
+                answer = input('  Encrypt this file now? [y/N] ').strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = 'n'
+            if answer == 'y':
+                enc = subprocess.run(
+                    ['sops', '--encrypt', '--output', str(f), str(f)],
+                    env=ENV,
+                )
+                if enc.returncode == 0:
+                    print(f'sops-mgr: ok   {f} (now encrypted)', file=sys.stderr)
+                    ok += 1
+                else:
+                    print(f'sops-mgr: ERROR: encryption failed for {f}', file=sys.stderr)
+                    failed += 1
+            else:
+                print(f'sops-mgr: SKIP {f}', file=sys.stderr)
+                failed += 1
+        else:
+            print(f'sops-mgr: FAIL {f}', file=sys.stderr)
+            print(f'  {stderr.strip()}', file=sys.stderr)
+            failed += 1
+
+    print(f'\nsops-mgr: verify complete — {ok} ok, {failed} failed', file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+# ── arg parsing ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog='sops-mgr',
+        description='Manage SOPS-encrypted secrets files across all packages.',
+    )
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('-r', '--re-encrypt', action='store_true', dest='re_encrypt',
+                   help='re-encrypt all *.sops.yaml files with current .sops.yaml keys')
+    g.add_argument('-v', '--verify', action='store_true',
+                   help='verify all *.sops.yaml files can be decrypted')
+    p.add_argument('-d', '--infra-dir', dest='infra_dir', default=None, metavar='PATH',
+                   help='search PATH for *.sops.yaml instead of $_INFRA_DIR '
+                        '(used by automation to scope to a target repo)')
+    return p.parse_args()
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    infra_dir = Path(args.infra_dir).resolve() if args.infra_dir else None
+    if args.re_encrypt:
+        cmd_re_encrypt(infra_dir)
+    elif args.verify:
+        cmd_verify(infra_dir)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
+        sys.exit(130)

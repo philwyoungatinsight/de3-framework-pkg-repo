@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# ramdisk-mgr — mount RAM-backed directories for framework runtime state.
+#
+# Modes:
+#   ramdisk-mgr [--setup]               Read framework_ramdisk.yaml; mount all declared dirs
+#   ramdisk-mgr --teardown              Unmount all dirs declared in framework_ramdisk.yaml
+#   ramdisk-mgr --path <dir> [options]  Mount/configure a single directory
+#
+# When called with no arguments, defaults to --setup.
+#
+# Options (single-dir mode):
+#   -p|--path   <dir>    (required) Directory to mount as a RAM drive
+#   -s|--size   <MB>     Size in MB; default 64
+#   -m|--mode   <octal>  Directory permissions; default 770
+#   -u|--user   <user>   Owner user; default current user
+#   -g|--group  <group>  Owner group; default current user's primary group
+#      --setup            Read config and mount all declared dirs (default when no --path)
+#   -t|--teardown         Unmount all dirs declared in framework_ramdisk.yaml
+#   -h|--help            Show this help
+#
+# Notes:
+#   Linux : uses tmpfs (noexec,nosuid,nodev); requires sudo for mount.
+#   macOS : uses hdiutil + newfs_hfs (HFS+ RAM disk).
+#   WSL2  : tmpfs can swap to Windows host disk; ensure BitLocker is enabled.
+#
+# Re-running is safe: already-mounted dirs with matching parameters are skipped;
+# changed parameters (size, mode, owner) are applied in-place without touching disk.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+MODE="setup"
+TARGET_PATH=""
+SIZE_MB=64
+DIR_MODE=770
+OWNER_USER="$(id -un)"
+OWNER_GROUP="$(id -gn)"
+
+_usage() {
+    sed -n '2,/^set -/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -p|--path)     TARGET_PATH="$2"; MODE="single"; shift ;;
+        -s|--size)     SIZE_MB="$2"; shift ;;
+        -m|--mode)     DIR_MODE="$2"; shift ;;
+        -u|--user)     OWNER_USER="$2"; shift ;;
+        -g|--group)    OWNER_GROUP="$2"; shift ;;
+        --setup)       MODE="setup" ;;
+        -t|--teardown) MODE="teardown" ;;
+        -h|--help)     _usage 0 ;;
+        *) echo "ramdisk-mgr: unknown argument: $1" >&2; _usage 1 ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------------
+# Setup mode — read config and mount all declared dirs
+# ---------------------------------------------------------------------------
+
+if [[ "$MODE" == "setup" ]]; then
+    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    source "$GIT_ROOT/set_env.sh"
+
+    if [[ "${CI:-}" == "true" ]] || ! tty -s 2>/dev/null; then
+        echo "ramdisk-mgr: non-interactive context, skipping."
+        exit 0
+    fi
+
+    RAMDISK_YAML="$("$_CONFIG_MGR" fw-setting framework_ramdisk)"
+
+    python3 - "$RAMDISK_YAML" "$0" <<'PYEOF'
+import sys, os, subprocess, yaml
+
+ramdisk_yaml, self_path = sys.argv[1], sys.argv[2]
+
+with open(ramdisk_yaml) as f:
+    cfg = yaml.safe_load(f)
+
+entries = cfg.get("framework_ramdisk", [])
+if not entries:
+    print("ramdisk-mgr: no entries declared in framework_ramdisk.yaml")
+    sys.exit(0)
+
+errors = 0
+for entry in entries:
+    env_var     = entry.get("env_var", "")
+    size_mb     = str(entry.get("size_mb", 64))
+    mode        = str(entry.get("mode", "")) if entry.get("mode") is not None else ""
+    owner_user  = entry.get("owner_user", "")
+    owner_group = entry.get("owner_group", "")
+    path        = os.environ.get(env_var, "")
+
+    if not env_var:
+        print(f"ramdisk-mgr: WARNING — entry missing env_var, skipping: {entry}")
+        continue
+    if int(size_mb) == 0:
+        print(f"ramdisk-mgr: {env_var} has size_mb=0, skipping.")
+        continue
+    if not path:
+        print(f"ramdisk-mgr: WARNING — {env_var} is unset, skipping.")
+        continue
+
+    cmd = [self_path, "--path", path, "--size", size_mb]
+    if mode:
+        cmd += ["--mode", mode]
+    if owner_user:
+        cmd += ["--user", owner_user]
+    if owner_group:
+        cmd += ["--group", owner_group]
+
+    print(f"ramdisk-mgr: mounting {env_var}={path} (size={size_mb}MB)")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"ramdisk-mgr: ERROR — failed to mount {path}", file=sys.stderr)
+        errors += 1
+
+sys.exit(1 if errors else 0)
+PYEOF
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Teardown mode — unmount all declared dirs that are currently RAM-backed
+# ---------------------------------------------------------------------------
+
+if [[ "$MODE" == "teardown" ]]; then
+    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    source "$GIT_ROOT/set_env.sh"
+
+    OS_TYPE=$(uname -s)
+
+    RAMDISK_YAML="$("$_CONFIG_MGR" fw-setting framework_ramdisk)"
+
+    python3 - "$RAMDISK_YAML" <<PYEOF
+import sys, os, subprocess, yaml
+
+ramdisk_yaml = sys.argv[1]
+
+with open(ramdisk_yaml) as f:
+    cfg = yaml.safe_load(f)
+
+entries = cfg.get("framework_ramdisk", [])
+errors = 0
+
+for entry in entries:
+    env_var = entry.get("env_var", "")
+    if not env_var:
+        continue
+    path = os.environ.get(env_var, "")
+    if not path:
+        print(f"ramdisk-mgr: {env_var} is unset, skipping.")
+        continue
+
+    os_type = subprocess.check_output(["uname", "-s"], text=True).strip()
+
+    if os_type == "Linux":
+        import re
+        with open("/proc/mounts") as f:
+            mounts = f.read()
+        if not re.search(rf"^tmpfs {re.escape(path)} tmpfs", mounts, re.MULTILINE):
+            print(f"ramdisk-mgr: {path} is not RAM-backed, skipping.")
+            continue
+        print(f"ramdisk-mgr: unmounting {env_var}={path}")
+        r = subprocess.run(["sudo", "umount", path])
+        if r.returncode != 0:
+            print(f"ramdisk-mgr: ERROR — failed to unmount {path}", file=sys.stderr)
+            errors += 1
+
+    elif os_type == "Darwin":
+        result = subprocess.run(["mount"], capture_output=True, text=True)
+        import re
+        m = re.search(rf"^(/dev/\S+) on {re.escape(path)} \(hfs,", result.stdout, re.MULTILINE)
+        if not m:
+            print(f"ramdisk-mgr: {path} is not RAM-backed, skipping.")
+            continue
+        disk_id = m.group(1)
+        print(f"ramdisk-mgr: unmounting {env_var}={path} ({disk_id})")
+        r1 = subprocess.run(["umount", path])
+        r2 = subprocess.run(["hdiutil", "detach", disk_id], capture_output=True)
+        if r1.returncode != 0 or r2.returncode != 0:
+            print(f"ramdisk-mgr: ERROR — failed to unmount {path}", file=sys.stderr)
+            errors += 1
+
+    else:
+        print(f"ramdisk-mgr: unsupported OS: {os_type}", file=sys.stderr)
+        errors += 1
+
+sys.exit(1 if errors else 0)
+PYEOF
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Single-dir mode — mount or configure one directory
+# ---------------------------------------------------------------------------
+
+if [[ -z "$TARGET_PATH" ]]; then
+    echo "ramdisk-mgr: --path is required in single-dir mode" >&2
+    _usage 1
+fi
+
+mkdir -p "$TARGET_PATH"
+if command -v realpath >/dev/null 2>&1; then
+    TARGET_PATH=$(realpath "$TARGET_PATH")
+else
+    TARGET_PATH=$(cd "$(dirname "$TARGET_PATH")" && pwd)/$(basename "$TARGET_PATH")
+fi
+
+TIMESTAMP=$(date +%s)
+OS_TYPE=$(uname -s)
+
+# ---------------------------------------------------------------------------
+# Detection helpers
+# ---------------------------------------------------------------------------
+
+is_ram_backed() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        grep -q "^tmpfs ${TARGET_PATH} tmpfs" /proc/mounts 2>/dev/null
+    elif [[ "$OS_TYPE" == "Darwin" ]]; then
+        mount 2>/dev/null | grep -q " on ${TARGET_PATH} (hfs,"
+    else
+        return 1
+    fi
+}
+
+get_current_size_mb() {
+    local size_k
+    size_k=$(grep "^tmpfs ${TARGET_PATH} tmpfs" /proc/mounts 2>/dev/null \
+        | grep -oP 'size=\K[0-9]+(?=k)') || true
+    [[ -n "$size_k" ]] && echo $(( size_k / 1024 )) || echo ""
+}
+
+get_current_mode() {
+    stat -c "%a" "$TARGET_PATH" 2>/dev/null || stat -f "%OLp" "$TARGET_PATH" 2>/dev/null || echo ""
+}
+
+get_owner() { stat -c "%U" "$1" 2>/dev/null || stat -f "%Su" "$1" 2>/dev/null || echo ""; }
+get_group() { stat -c "%G" "$1" 2>/dev/null || stat -f "%Sg" "$1" 2>/dev/null || echo ""; }
+
+# ---------------------------------------------------------------------------
+# RAM staging (data never touches disk during transitions)
+# ---------------------------------------------------------------------------
+
+STAGING_PATH="/dev/shm/ramdisk-staging-${TIMESTAMP}"
+STAGING_DISK_ID=""
+
+setup_staging() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        mkdir -p "$STAGING_PATH"
+        chmod 700 "$STAGING_PATH"
+    else
+        mkdir -p "$STAGING_PATH"
+        local sectors=$(( SIZE_MB * 2048 ))
+        STAGING_DISK_ID=$(hdiutil attach -nomount "ram://${sectors}" | head -n 1 | awk '{print $1}')
+        newfs_hfs -v "RamdiskStaging" "$STAGING_DISK_ID" >/dev/null
+        mount -t hfs -o noatime "$STAGING_DISK_ID" "$STAGING_PATH"
+    fi
+}
+
+cleanup_staging() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        rm -rf "$STAGING_PATH" 2>/dev/null || true
+    else
+        umount "$STAGING_PATH" 2>/dev/null || true
+        [[ -n "$STAGING_DISK_ID" ]] && hdiutil detach "$STAGING_DISK_ID" 2>/dev/null || true
+        rmdir "$STAGING_PATH" 2>/dev/null || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Mount helpers
+# ---------------------------------------------------------------------------
+
+mount_linux() {
+    if uname -r | grep -qi "microsoft"; then
+        echo "WARNING [WSL2]: tmpfs can swap to Windows host; ensure BitLocker is enabled."
+    fi
+    echo "ramdisk-mgr: mounting ${SIZE_MB}MB tmpfs via sudo..."
+    sudo mount -t tmpfs -o "size=${SIZE_MB}M,mode=${DIR_MODE},noexec,nosuid,nodev" tmpfs "$TARGET_PATH"
+}
+
+mount_macos() {
+    echo "ramdisk-mgr: allocating ${SIZE_MB}MB RAM disk on macOS..."
+    local sectors=$(( SIZE_MB * 2048 ))
+    local disk_id
+    disk_id=$(hdiutil attach -nomount "ram://${sectors}" | head -n 1 | awk '{print $1}')
+    newfs_hfs -v "Ramdisk" "$disk_id" >/dev/null
+    mount -t hfs -o noatime "$disk_id" "$TARGET_PATH"
+}
+
+do_mount() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        mount_linux
+    elif [[ "$OS_TYPE" == "Darwin" ]]; then
+        mount_macos
+    else
+        echo "ramdisk-mgr: unsupported OS: $OS_TYPE" >&2; exit 1
+    fi
+}
+
+set_ownership() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        sudo chown -R "${OWNER_USER}:${OWNER_GROUP}" "$TARGET_PATH"
+    else
+        chown -R "${OWNER_USER}:${OWNER_GROUP}" "$TARGET_PATH"
+    fi
+}
+
+set_mode() {
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        sudo chmod "$DIR_MODE" "$TARGET_PATH"
+    else
+        chmod "$DIR_MODE" "$TARGET_PATH"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Already RAM-backed: apply changed parameters in-place
+# ---------------------------------------------------------------------------
+
+if is_ram_backed; then
+    CURRENT_OWNER=$(get_owner "$TARGET_PATH")
+    CURRENT_GROUP=$(get_group "$TARGET_PATH")
+    CURRENT_MODE=$(get_current_mode)
+    NEEDS_REMOUNT=false
+    NEEDS_CHOWN=false
+    NEEDS_CHMOD=false
+
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        CURRENT_SIZE_MB=$(get_current_size_mb)
+        if [[ -n "$CURRENT_SIZE_MB" && "$CURRENT_SIZE_MB" != "$SIZE_MB" ]]; then
+            echo "ramdisk-mgr: size change: ${CURRENT_SIZE_MB}MB → ${SIZE_MB}MB"
+            NEEDS_REMOUNT=true
+        fi
+    fi
+
+    if [[ "$CURRENT_OWNER" != "$OWNER_USER" || "$CURRENT_GROUP" != "$OWNER_GROUP" ]]; then
+        echo "ramdisk-mgr: ownership change: ${CURRENT_OWNER}:${CURRENT_GROUP} → ${OWNER_USER}:${OWNER_GROUP}"
+        NEEDS_CHOWN=true
+    fi
+
+    if [[ -n "$CURRENT_MODE" && "$CURRENT_MODE" != "$DIR_MODE" ]]; then
+        echo "ramdisk-mgr: mode change: ${CURRENT_MODE} → ${DIR_MODE}"
+        NEEDS_CHMOD=true
+    fi
+
+    if [[ "$NEEDS_REMOUNT" == false && "$NEEDS_CHOWN" == false && "$NEEDS_CHMOD" == false ]]; then
+        echo "ramdisk-mgr: $TARGET_PATH already RAM-backed with matching parameters."
+        exit 0
+    fi
+
+    if [[ "$NEEDS_REMOUNT" == true ]]; then
+        if [[ "$OS_TYPE" == "Linux" ]]; then
+            setup_staging
+            sudo cp -a "$TARGET_PATH/." "$STAGING_PATH/" 2>/dev/null || true
+            sudo chown -R "${OWNER_USER}:${OWNER_GROUP}" "$STAGING_PATH"
+            sudo umount "$TARGET_PATH"
+            do_mount
+            sudo cp -a "$STAGING_PATH/." "$TARGET_PATH/"
+            set_ownership; set_mode
+            cleanup_staging
+        else
+            setup_staging
+            cp -a "$TARGET_PATH/." "$STAGING_PATH/" 2>/dev/null || true
+            local_disk=$(mount 2>/dev/null | grep " on ${TARGET_PATH} (hfs," | awk '{print $1}')
+            umount "$TARGET_PATH"
+            [[ -n "$local_disk" ]] && hdiutil detach "$local_disk" 2>/dev/null || true
+            do_mount
+            cp -a "$STAGING_PATH/." "$TARGET_PATH/"
+            chown -R "${OWNER_USER}:${OWNER_GROUP}" "$TARGET_PATH"
+            chmod "$DIR_MODE" "$TARGET_PATH"
+            cleanup_staging
+        fi
+        echo "ramdisk-mgr: remounted with new size."
+    fi
+
+    [[ "$NEEDS_CHOWN" == true ]] && { echo "ramdisk-mgr: applying ownership..."; set_ownership; }
+    [[ "$NEEDS_CHMOD" == true ]] && { echo "ramdisk-mgr: applying permissions..."; set_mode; }
+
+    echo "ramdisk-mgr: updated $TARGET_PATH"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Not yet RAM-backed: stage existing data, mount, restore
+# ---------------------------------------------------------------------------
+
+HAS_DATA=false
+if [[ -d "$TARGET_PATH" && "$(ls -A "$TARGET_PATH" 2>/dev/null)" ]]; then
+    HAS_DATA=true
+fi
+
+if [[ "$HAS_DATA" == true ]]; then
+    echo "ramdisk-mgr: staging existing data in RAM before mount..."
+    setup_staging
+    cp -a "$TARGET_PATH/." "$STAGING_PATH/"
+
+    if [[ "$OS_TYPE" == "Linux" ]] && command -v shred >/dev/null 2>&1; then
+        set +e
+        find "$TARGET_PATH" -type f -exec shred -u {} + >/dev/null 2>&1
+        set -e
+    fi
+    rm -rf "$TARGET_PATH"
+    mkdir -p "$TARGET_PATH"
+fi
+
+do_mount
+set_ownership
+set_mode
+
+if [[ "$HAS_DATA" == true ]]; then
+    echo "ramdisk-mgr: restoring data from RAM staging..."
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        sudo cp -a "$STAGING_PATH/." "$TARGET_PATH/"
+    else
+        cp -a "$STAGING_PATH/." "$TARGET_PATH/"
+    fi
+    cleanup_staging
+fi
+
+echo "ramdisk-mgr: mounted $TARGET_PATH (${SIZE_MB}MB)"

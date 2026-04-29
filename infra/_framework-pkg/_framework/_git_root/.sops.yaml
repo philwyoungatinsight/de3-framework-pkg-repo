@@ -1,0 +1,29 @@
+stores:
+  yaml:
+    indent: 2
+creation_rules:
+  ################################################################################
+  # Package-specific overrides — must come BEFORE the general rule below.
+  # SOPS uses the first matching rule; more-specific path_regex goes first.
+  ################################################################################
+
+  # Example: use a different set of keys to encrypt sops files for a particular package.
+  - path_regex: '.*infra/unifi-pkg/_config/.*\.sops\.yaml$'
+    #age: >-
+    #  age1qulf804yasfvatm5macg09ny5uxqcyv8g8yqlfj9v8ycgrutdshsfrjvlc
+    pgp: >-
+      446B4127CF4E00C389579F20986E9FAE2FB2BEBD,
+      1FAFFDF2C76C758F736178E2B776DF4CEB6B692B
+
+  ################################################################################
+  # Default encryption keys for all packages
+  # (infra/<pkg>/_config/<pkg>_secrets.sops.yaml)
+  ################################################################################
+  - path_regex: '.*infra/[^/]+/_config/.*\.sops\.yaml$'
+    #age: >-
+    #  age1qulf804yasfvatm5macg09ny5uxqcyv8g8yqlfj9v8ycgrutdshsfrjvlc
+    pgp: >-
+      446B4127CF4E00C389579F20986E9FAE2FB2BEBD,
+      1FAFFDF2C76C758F736178E2B776DF4CEB6B692B
+
+# phil: 1FAFFDF2C76C758F736178E2B776DF4CEB6B692B, 446B4127CF4E00C389579F20986E9FAE2FB2BEBD

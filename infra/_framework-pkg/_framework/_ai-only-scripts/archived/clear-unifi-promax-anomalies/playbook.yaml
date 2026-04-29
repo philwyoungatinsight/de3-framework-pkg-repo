@@ -1,0 +1,99 @@
+---
+# Clear stale / anomalous port_override entries from the UniFi Pro Max 16-Port.
+#
+# An anomaly is a port_override whose portconf_id points to a portconf that no
+# longer exists in UniFi (e.g. after management_only / pxe_host_trunk were
+# deleted).  Left uncleaned, the switch silently falls back to the default
+# profile but the entries clutter the device state.
+#
+# Tasks:
+#   1. Load framework config via config_base.
+#   2. Extract UniFi API URL, Pro Max MAC, and credentials.
+#   3. Run the Python script.  Default: dry-run.  Pass --extra-vars "fix=true"
+#      to actually apply the changes.
+
+- name: Clear UniFi Pro Max port-override anomalies
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    script_dir: "{{ playbook_dir }}"
+    tmp_config: "/tmp/clear-promax-anomalies-config.json"
+    fix: false
+
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Discover UniFi provider root path (has _provider_unifi_api_url)
+      ansible.builtin.set_fact:
+        _unifi_root_path: >-
+          {{
+            (_tg_providers.unifi.config_params | default({}) | dict2items
+            | selectattr('value._provider_unifi_api_url', 'defined')
+            | map(attribute='key') | list | first) | default('')
+          }}
+
+    - name: Capture UniFi base config
+      ansible.builtin.set_fact:
+        _unifi_base_cfg: "{{ _unifi_root_path | ancestor_merge(_all_config_params) }}"
+        _unifi_device_cfg: >-
+          {{
+            (_tg_providers.unifi.config_params | default({}) | dict2items
+            | selectattr('key', 'match', '.*/device$')
+            | rejectattr('key', 'match', '.*/examples/.*')
+            | map(attribute='value') | list | first) | default({})
+          }}
+        _unifi_secrets: >-
+          {{
+            (_tg_providers_secrets.unifi.config_params | default({})).get(_unifi_root_path, {}) | default({})
+          }}
+
+    - name: Assert UniFi credentials are present
+      ansible.builtin.fail:
+        msg: >-
+          UniFi credentials not found at {{ _unifi_root_path }} in secrets YAML.
+          Check infra/unifi-pkg/_config/unifi-pkg_secrets.sops.yaml.
+      when: >-
+        _unifi_secrets._provider_unifi_username is not defined or
+        _unifi_secrets._provider_unifi_password is not defined
+
+    - name: Find Pro Max MAC from device config
+      ansible.builtin.set_fact:
+        _promax_mac: >-
+          {{
+            (_unifi_device_cfg.devices | default({})).get('switch_pro_max', {}).get('mac', '')
+          }}
+
+    - name: Assert Pro Max MAC is defined
+      ansible.builtin.fail:
+        msg: "switch_pro_max.mac not found in device config — check pwy-home-lab-pkg.yaml"
+      when: not _promax_mac
+
+    - name: Write script config to temp file
+      ansible.builtin.copy:
+        content: "{{ {'unifi_url': _unifi_base_cfg._provider_unifi_api_url, 'promax_mac': _promax_mac} | to_nice_json }}"
+        dest: "{{ tmp_config }}"
+        mode: "0600"
+
+    - name: Run clear-promax-anomalies script
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ script_dir }}/scripts/clear-promax-anomalies.py
+          {{ tmp_config }}
+          {{ '--fix' if (fix | bool) else '' }}
+      environment:
+        UNIFI_USERNAME: "{{ _unifi_secrets._provider_unifi_username }}"
+        UNIFI_PASSWORD: "{{ _unifi_secrets._provider_unifi_password }}"
+      register: _script_result
+
+    - name: Show script output
+      ansible.builtin.debug:
+        msg: "{{ _script_result.stdout_lines }}"
+
+    - name: Clean up temp config file
+      ansible.builtin.file:
+        path: "{{ tmp_config }}"
+        state: absent

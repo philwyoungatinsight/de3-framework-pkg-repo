@@ -1,0 +1,42 @@
+---
+# Test SSH connectivity to ms01-02 from the MaaS server (jump box)
+- name: Check ms01-02 reachability from MaaS server
+  hosts: maas_region
+  gather_facts: false
+
+  tasks:
+    - name: Test TCP port 22 on ms01-02
+      ansible.builtin.shell: |
+        nc -z -w5 10.0.12.239 22 2>&1 && echo "PORT 22: OPEN" || echo "PORT 22: CLOSED"
+      register: _nc22
+      changed_when: false
+
+    - name: Show port 22 result
+      ansible.builtin.debug:
+        msg: "{{ _nc22.stdout }}"
+
+    - name: Try SSH to ms01-02 from MaaS server
+      ansible.builtin.shell: |
+        ssh -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            ubuntu@10.0.12.239 \
+            "uptime" 2>&1 || echo "SSH failed: rc=$?"
+      register: _ssh_test
+      changed_when: false
+
+    - name: Show SSH result
+      ansible.builtin.debug:
+        msg: "{{ _ssh_test.stdout_lines }}"
+
+    - name: Test TCP port 16993 on ms01-02 AMT
+      ansible.builtin.shell: |
+        timeout 10 bash -c "echo Q | openssl s_client -connect 10.0.11.11:16993 2>&1" | head -20 || true
+      environment:
+        OPENSSL_CONF: /var/snap/maas/common/openssl-legacy.cnf
+      register: _tls_test
+      changed_when: false
+
+    - name: Show TLS test result
+      ansible.builtin.debug:
+        msg: "{{ _tls_test.stdout_lines }}"

@@ -1,0 +1,32 @@
+---
+# Reboot ms01-02 from its current Ubuntu OS to reset the AMT firmware TLS stack.
+# ms01-02 is still running Ubuntu at its provisioning IP (10.0.12.239).
+# After reboot, AMT port 16993 should respond to wsman again.
+#
+# The machine's AMT firmware is accepting TCP connections on port 16993 but
+# hanging during the TLS handshake — a known symptom of firmware that needs
+# a hard power cycle.  Rebooting the host OS resets AMT firmware.
+
+- name: Reboot ms01-02 via its current Ubuntu OS
+  hosts: ms01-02
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_user: ubuntu
+
+  tasks:
+    - name: Verify ms01-02 is reachable
+      ansible.builtin.ping:
+
+    - name: Reboot ms01-02 to reset AMT firmware
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Rebooting to reset AMT firmware TLS stack"
+      become: true
+
+    - name: Confirm ms01-02 is back online after reboot
+      ansible.builtin.ping:
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: "ms01-02 rebooted successfully — AMT firmware should now respond to wsman"

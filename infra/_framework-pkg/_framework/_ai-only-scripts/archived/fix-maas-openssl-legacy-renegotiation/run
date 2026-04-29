@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Enable OpenSSL UnsafeLegacyRenegotiation on BOTH the MaaS region server AND
+# rack controller so that MaaS's wsman binary can communicate with Intel AMT
+# firmware (which requires legacy TLS renegotiation).
+#
+# Must run on the rack controller (10.0.10.13) because that is the host that
+# spawns wsman subprocesses for AMT power operations.
+#
+# This is idempotent: running it multiple times is safe.
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+export GIT_ROOT
+
+# shellcheck source=/dev/null
+. "$GIT_ROOT/set_env.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# shellcheck source=/dev/null
+. "$_UTILITIES_DIR/bash/init.sh"
+
+export PYTHON_VERSION='python3.12'
+_activate_ansible_locally "$SCRIPT_DIR"
+
+# _activate_ansible_locally exports ANSIBLE_PYTHON_INTERPRETER pointing at
+# the local .venv; override it so the remote host uses its own system Python.
+ansible-playbook \
+  -i "10.0.10.11,10.0.10.13," \
+  -e "ansible_user=ubuntu ansible_python_interpreter=/usr/bin/python3 ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'" \
+  "${SCRIPT_DIR}/playbook.yaml" \
+  "$@"

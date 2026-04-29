@@ -1,0 +1,148 @@
+---
+# Diagnose why ms01-02 AMT power-cycle fails from the MaaS server.
+# Tests:
+#   1. nc connectivity to port 16993
+#   2. Whether the legacy OpenSSL config exists
+#   3. Runs amt-power-cycle with full stdout/stderr visible
+#
+# ms01-02 amt_address: 10.0.11.11  (management VLAN)
+# MaaS server:         10.0.10.11  (cloud_public VLAN)
+
+- name: Load config to get ms01-02 AMT credentials
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+
+    - name: Capture MaaS config facts
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-region/tasks/capture-config-fact.yaml"
+
+    - name: Build machine list (same logic as maas-machines-precheck)
+      ansible.builtin.set_fact:
+        _all_machines: >-
+          {%- set machines = [] -%}
+          {%- set params  = _tg_providers.maas.config_params | default({}) -%}
+          {%- set secrets = _tg_providers_secrets.maas.config_params | default({}) -%}
+          {%- set all_params = _all_config_params | default({}) -%}
+          {%- for path, cfg in params.items() -%}
+            {%- if cfg is mapping
+                and cfg.get('_wave') == 'maas.lifecycle.new'
+                and not cfg.get('skip', false) -%}
+              {%- set ns = namespace(skip_build=false) -%}
+              {%- set parts = path.split('/') -%}
+              {%- for i in range(1, parts | length + 1) -%}
+                {%- set ancestor = parts[:i] | join('/') -%}
+                {%- set anc_cfg = all_params.get(ancestor, {}) -%}
+                {%- if anc_cfg is mapping and anc_cfg.get('_skip_on_build', false) -%}
+                  {%- set ns.skip_build = true -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if not ns.skip_build -%}
+                {%- set sec = secrets.get(path, {}) -%}
+                {%- set _ = machines.append({
+                    'hostname':           path.split('/')[-1],
+                    'path':               path,
+                    'power_type':         cfg.get('power_type', 'manual'),
+                    'pxe_mac_address':    cfg.get('pxe_mac_address', ''),
+                    'amt_address':        cfg.get('amt_address', ''),
+                    'mgmt_wake_via_plug': cfg.get('mgmt_wake_via_plug', false),
+                    'smart_plug_host':    cfg.get('smart_plug_host', ''),
+                    'smart_plug_type':    cfg.get('smart_plug_type', 'kasa'),
+                    'power_pass':         sec.get('power_pass', '')
+                }) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ machines }}
+
+    - name: Find ms01-02 in machine list
+      ansible.builtin.set_fact:
+        _ms01_02: >-
+          {{ _all_machines | selectattr('hostname', 'equalto', 'ms01-02') | list | first }}
+
+    - name: Show ms01-02 config (non-sensitive fields)
+      ansible.builtin.debug:
+        msg:
+          hostname: "{{ _ms01_02.hostname }}"
+          amt_address: "{{ _ms01_02.amt_address }}"
+          power_type: "{{ _ms01_02.power_type }}"
+          mgmt_wake_via_plug: "{{ _ms01_02.mgmt_wake_via_plug }}"
+          power_pass_set: "{{ 'YES' if _ms01_02.power_pass else 'NO (empty!)' }}"
+
+- name: Diagnose ms01-02 AMT from MaaS server
+  hosts: maas_region
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    _amt_ip: "{{ hostvars['localhost']['_ms01_02']['amt_address'] }}"
+    _amt_pass: "{{ hostvars['localhost']['_ms01_02']['power_pass'] }}"
+    _amt_port: 16993
+    _legacy_openssl: /var/snap/maas/common/openssl-legacy.cnf
+
+  tasks:
+    - name: Check if legacy OpenSSL config exists
+      ansible.builtin.stat:
+        path: "{{ _legacy_openssl }}"
+      register: _openssl_stat
+
+    - name: Report legacy OpenSSL config status
+      ansible.builtin.debug:
+        msg: "Legacy OpenSSL config at {{ _legacy_openssl }}: {{ 'EXISTS' if _openssl_stat.stat.exists else 'MISSING' }}"
+
+    - name: Test TCP connectivity to AMT port 16993
+      ansible.builtin.shell: |
+        if nc -z -w5 "{{ _amt_ip }}" {{ _amt_port }} 2>/dev/null; then
+          echo "TCP port {{ _amt_port }} on {{ _amt_ip }}: OPEN"
+        else
+          echo "TCP port {{ _amt_port }} on {{ _amt_ip }}: CLOSED / UNREACHABLE"
+        fi
+      register: _nc_result
+      changed_when: false
+
+    - name: Show connectivity result
+      ansible.builtin.debug:
+        msg: "{{ _nc_result.stdout }}"
+
+    - name: Try wsman enumerate (no no_log — shows actual error)
+      ansible.builtin.shell: |
+        wsman enumerate \
+          --endpoint "https://admin:{{ _amt_pass }}@{{ _amt_ip }}:{{ _amt_port }}" \
+          --noverifypeer --noverifyhost \
+          "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem" \
+          2>&1 | head -30 || true
+      environment:
+        OPENSSL_CONF: "{{ _legacy_openssl }}"
+      register: _wsman_result
+      changed_when: false
+      no_log: false
+
+    - name: Show wsman result
+      ansible.builtin.debug:
+        msg: "{{ _wsman_result.stdout_lines }}"
+
+    - name: Try amt-power-cycle script directly (shows full output)
+      ansible.builtin.script:
+        cmd: >-
+          {{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/amt-power-cycle/run
+          {{ _amt_ip }}
+      environment:
+        AMT_PASS: "{{ _amt_pass }}"
+        OPENSSL_CONF: "{{ _legacy_openssl }}"
+      register: _cycle_result
+      failed_when: false
+      no_log: false
+
+    - name: Show amt-power-cycle stdout
+      ansible.builtin.debug:
+        msg: "stdout: {{ _cycle_result.stdout_lines | default([]) }}"
+
+    - name: Show amt-power-cycle stderr
+      ansible.builtin.debug:
+        msg: "stderr: {{ _cycle_result.stderr_lines | default([]) }}"
+
+    - name: Show amt-power-cycle rc
+      ansible.builtin.debug:
+        msg: "rc: {{ _cycle_result.rc }}"

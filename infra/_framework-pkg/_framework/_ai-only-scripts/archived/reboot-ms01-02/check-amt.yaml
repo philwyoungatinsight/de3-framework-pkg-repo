@@ -1,0 +1,53 @@
+---
+# Check if ms01-02 is back up and AMT port is now responsive.
+
+- name: Test ms01-02 SSH and AMT after reboot
+  hosts: ms01-02
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Check if ms01-02 SSH is reachable
+      ansible.builtin.ping:
+
+    - name: Report SSH connectivity
+      ansible.builtin.debug:
+        msg: "ms01-02 SSH: REACHABLE"
+
+- name: Test AMT from MaaS server after reboot
+  hosts: maas_region
+  gather_facts: false
+
+  tasks:
+    - name: Test TCP connectivity to AMT port 16993
+      ansible.builtin.shell: |
+        if nc -z -w5 10.0.11.11 16993 2>/dev/null; then
+          echo "TCP port 16993 on 10.0.11.11: OPEN"
+        else
+          echo "TCP port 16993 on 10.0.11.11: CLOSED / UNREACHABLE"
+        fi
+      register: _nc_result
+      changed_when: false
+
+    - name: Show connectivity result
+      ansible.builtin.debug:
+        msg: "{{ _nc_result.stdout }}"
+
+    - name: Try wsman with timeout (30s max)
+      ansible.builtin.shell: |
+        timeout 30 wsman enumerate \
+          --endpoint "https://admin:${AMT_PASS}@10.0.11.11:16993" \
+          --noverifypeer --noverifyhost \
+          "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem" \
+          2>&1 | head -15 || echo "wsman exited with rc=$?"
+      environment:
+        AMT_PASS: "{{ hostvars['localhost']['_ms01_02_pass'] | default('') }}"
+        OPENSSL_CONF: /var/snap/maas/common/openssl-legacy.cnf
+      register: _wsman_result
+      changed_when: false
+      no_log: false
+
+    - name: Show wsman result
+      ansible.builtin.debug:
+        msg: "{{ _wsman_result.stdout_lines }}"

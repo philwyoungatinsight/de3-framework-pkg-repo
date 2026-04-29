@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "$GIT_ROOT/set_env.sh"
+
+VENV_BASE="$SCRIPT_DIR"
+# shellcheck source=/dev/null
+_activate_ansible_locally "$VENV_BASE"
+
+INVENTORY="$_DYNAMIC_DIR/ansible/inventory/hosts.yml"
+
+# Regenerate inventory if it doesn't exist
+if [[ ! -f "$INVENTORY" ]]; then
+  echo "Regenerating Ansible inventory..."
+  "$_GENERATE_INVENTORY" --test
+fi
+
+export ANSIBLE_HOST_KEY_CHECKING=False
+# _ANSIBLE_ROLES_DIR is set by set_env.sh — do not override
+
+echo "=== Recovering ms01-01: releasing in MaaS ==="
+ansible-playbook \
+  --inventory "$INVENTORY" \
+  "$SCRIPT_DIR/playbook.yaml" \
+  "$@"
