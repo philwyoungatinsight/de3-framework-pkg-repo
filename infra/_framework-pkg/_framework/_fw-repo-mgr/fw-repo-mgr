@@ -645,10 +645,13 @@ def build_repo(repo_name: str, force_push: bool, cfg: Config) -> None:
         set_env_link    = repo_dir / "set_env.sh"
         original_target = os.readlink(set_env_link) if set_env_link.is_symlink() else None
         set_env_link.unlink(missing_ok=True)
+        # Use the caller's _FRAMEWORK_PKG_DIR (always valid) rather than
+        # $SHIM_ROOT/infra/_framework-pkg, which is a dangling symlink until after sync.
+        caller_fw_pkg_dir = os.environ.get("_FRAMEWORK_PKG_DIR", "")
         set_env_link.write_text(
             "#!/bin/bash\n"
             '_SHIM_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"\n'
-            f'export _FRAMEWORK_PKG_DIR="$_SHIM_ROOT/infra/_framework-pkg"\n'
+            f'export _FRAMEWORK_PKG_DIR="{caller_fw_pkg_dir}"\n'
             f'export _FRAMEWORK_MAIN_PACKAGE="{config_pkg}"\n'
             f'export _FRAMEWORK_MAIN_PACKAGE_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
             f'export _FRAMEWORK_CONFIG_PKG="{config_pkg}"\n'
