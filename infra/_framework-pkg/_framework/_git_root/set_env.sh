@@ -11,6 +11,9 @@
 #      SOPS files into $_CONFIG_DIR (Terragrunt decrypts secrets at runtime via
 #      sops_decrypt_file — no secret is written to disk in plaintext)
 
+# Idempotent: already sourced if _GIT_ROOT and _UTILITIES_DIR are both set.
+[[ -n "${_GIT_ROOT:-}" && -n "${_UTILITIES_DIR:-}" ]] && return 0
+
 _set_env_export_vars() {
     # --- Repository root paths ---
     # Everything is derived from _GIT_ROOT so this script works from any subdirectory.
