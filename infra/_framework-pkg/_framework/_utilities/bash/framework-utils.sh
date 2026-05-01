@@ -19,7 +19,7 @@ function handle_error {
 trap handle_error ERR
 
 # Set Config variables
-. $(git rev-parse --show-toplevel)/set_env.sh
+. ${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh
 
 ################################################################################
 # Functions

@@ -17,9 +17,13 @@
 _set_env_export_vars() {
     # --- Repository root paths ---
     # Everything is derived from _GIT_ROOT so this script works from any subdirectory.
-    _GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+    # Use BASH_SOURCE[0] (the path of set_env.sh itself) rather than `git rev-parse` so
+    # that this works correctly when sourced from inside a symlinked directory that belongs
+    # to a different git repo (e.g. an embedded package checkout). set_env.sh lives at the
+    # deployment repo root by convention, so dirname of its sourced path is always correct.
+    _GIT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -z "$_GIT_ROOT" ]; then
-        echo "FATAL: not inside a git repository." >&2; return 1
+        echo "FATAL: could not determine git root from BASH_SOURCE." >&2; return 1
     fi
     export _GIT_ROOT
 
