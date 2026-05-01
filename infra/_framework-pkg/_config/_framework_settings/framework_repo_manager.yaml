@@ -13,8 +13,8 @@ framework_repo_manager:
   # Each entry supplies the url and ref used when a per-repo source_repo block
   # references only the name without explicit url/ref.
   source_repo_defaults:
-    - name: de3-runner
-      url: https://github.com/philwyoungatinsight/de3-runner.git
+    - name: de3-framework-pkg-repo
+      url: https://github.com/philwyoungatinsight/de3-framework-pkg-repo.git
       ref: main          # default ref when not overridden per target
 
   # Package automatically prepended to every repo's framework_packages list.
