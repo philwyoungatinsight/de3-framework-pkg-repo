@@ -47,13 +47,18 @@ Set `_skip_on_build: true` at an ancestor path; all child units inherit the valu
 ```yaml
 <pkg>:
   config_params:
-    <pkg>/_stack/<provider>/examples:
-      _skip_on_build: true    # all units under examples/ are skipped on build
+    <pkg>/_stack/<provider>/examples-archive:
+      _env: example
+      _provider: <provider>
+      _skip_on_build: true    # all units under examples-archive/ are skipped on build
+      _region: example-lab
 ```
+
+The standard directory name for example trees is `examples-archive/`. Each package repo ships its examples under `infra/<pkg>/_stack/<provider>/examples-archive/example-lab/...` with `_skip_on_build: true` at the `examples-archive` ancestor. Units under `examples-archive` are runnable — copy the directory to a new deployment repo and fill in real credentials/IPs.
 
 | Parameter | Inherits? | Excludes from | Use case |
 |-----------|-----------|---------------|----------|
-| `_skip_on_build: true` | Yes | `apply`, `plan`, `validate`, `output`, `state` | Example trees shipped with a package but not deployed by default. Set once at the ancestor `examples/` path. Override with `_skip_on_build: false` at a child path to re-enable a specific subtree. |
+| `_skip_on_build: true` | Yes | `apply`, `plan`, `validate`, `output`, `state` | Example trees shipped with a package but not deployed by default. Set once at the ancestor `examples-archive/` path. Override with `_skip_on_build: false` at a child path to re-enable a specific subtree. |
 
 ---
 
@@ -74,16 +79,23 @@ Use `make clean-all` when you need a fully clean slate. Use `make clean` when yo
 ```yaml
 proxmox-pkg:
   config_params:
-    proxmox-pkg/_stack/proxmox/examples:
+    proxmox-pkg/_stack/proxmox/examples-archive:
+      _env: example
       _provider: proxmox
-      _skip_on_build: true       # entire examples/ subtree skipped by default
-    proxmox-pkg/_stack/proxmox/examples/pwy-homelab:
-      env: dev
-      region: pwy-homelab
-      # inherits _skip_on_build: true — not deployed
-    proxmox-pkg/_stack/proxmox/examples/pwy-homelab/pve-nodes/pve-1:
-      _skip_on_build: false      # override: this specific subtree IS deployed
+      _skip_on_build: true       # entire examples-archive/ subtree skipped by default
+      _region: example-lab
+      project_prefix: example
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab/pve-nodes/pve-1:
+      _provider_proxmox_endpoint: https://10.0.10.115:8006   # placeholder
       node_name: pve
+      datastore_vm: local-zfs
+      # inherits _skip_on_build: true — not deployed unless copied to a deployment package
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab/pve-nodes/pve-1/vms/test/test-ubuntu-vm-1:
+      _skip_on_build: false      # override: re-enable this specific unit in the deployment package
+      _wave: vms.proxmox.from-web.ubuntu
+      cpu_cores: 2
+      disk_size: 32
+      memory_mb: 2048
 ```
 
 ## Example: preserve network config across build and clean cycles
