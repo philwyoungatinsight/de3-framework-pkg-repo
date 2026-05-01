@@ -161,10 +161,13 @@ class Config:
             return ""
         if r.get("config_package"):
             return r["config_package"]
-        return next(
-            (p["name"] for p in r.get("framework_packages", []) if p.get("is_main_package")),
-            ""
-        )
+        pkgs = r.get("framework_packages", [])
+        explicit = next((p["name"] for p in pkgs if p.get("is_main_package")), "")
+        if explicit:
+            return explicit
+        # Single embedded package is implicitly the main package (no annotation required)
+        embedded = [p["name"] for p in pkgs if p.get("package_type") == "embedded"]
+        return embedded[0] if len(embedded) == 1 else ""
 
     def ext_pkg_base(self) -> str:
         fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
@@ -261,6 +264,23 @@ def validate_naming_rules(cfg: Config, scope: str = "") -> None:
                         f"package_names_must_not_contain_special_chars: '{n}'"
                         " (only a-z, 0-9, _, - allowed)"
                     )
+
+        elif rule_name == "repos_must_have_main_package":
+            for r in repos:
+                rname = r.get("name", "")
+                if not cfg.config_package(rname):
+                    embedded = [p["name"] for p in r.get("framework_packages", [])
+                                if p.get("package_type") == "embedded"]
+                    if not embedded:
+                        errors.append(
+                            f"repos_must_have_main_package: '{rname}' has no embedded packages —"
+                            " add an embedded package with is_main_package: true"
+                        )
+                    else:
+                        errors.append(
+                            f"repos_must_have_main_package: '{rname}' has multiple embedded"
+                            f" packages {embedded} with none marked is_main_package: true"
+                        )
 
         else:
             errors.append(f"Unknown rule name: '{rule_name}'")
@@ -620,10 +640,12 @@ def build_repo(repo_name: str, force_push: bool, cfg: Config) -> None:
             / "_framework_settings" / "framework_packages.yaml"
         )
     else:
-        fw_pkgs_out = (
-            repo_dir / "infra" / "_framework-pkg" / "_config" / "framework_packages.yaml"
+        # Unreachable: validate_naming_rules (repos_must_have_main_package) ensures
+        # every repo has a resolvable main package before build_repo() proceeds.
+        sys.exit(
+            f"BUG: no main package resolved for '{repo_name}' — "
+            "repos_must_have_main_package validation should have caught this"
         )
-        fw_pkgs_out.parent.mkdir(parents=True, exist_ok=True)
 
     write_framework_packages_yaml(repo_name, fw_pkgs_out, cfg)
     print(f"Wrote: {fw_pkgs_out}")
@@ -838,8 +860,17 @@ Workflow:
   1. Add entries to framework_repo_manager.yaml (source_repo_defaults + framework_repos)
   2. fw-repo-mgr --build <name>   → clone source, prune, update packages, sync, commit, push
 
-config_package support:
-  Set config_package: <pkg> on a repo entry so the tool writes:
+main package requirement:
+  Every repo must resolve to exactly one main package. Resolution order:
+    1. config_package: <pkg>  on the repo entry (explicit override)
+    2. is_main_package: true  on a framework_packages entry
+    3. The single embedded package, if only one exists (implicit — no annotation needed)
+  If none apply, --validate and --build both error with repos_must_have_main_package.
+  Enforce this check via framework_package_naming_rules:
+    - name: repos_must_have_main_package
+      value: true
+
+  The main package anchors all generated config:
     config/_framework.yaml           (sets _FRAMEWORK_MAIN_PACKAGE)
     infra/<pkg>/_config/_framework_settings/framework_packages.yaml
     infra/<pkg>/_config/_framework_settings/framework_package_repositories.yaml

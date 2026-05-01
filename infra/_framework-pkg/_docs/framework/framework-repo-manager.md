@@ -48,18 +48,33 @@ available as `$_FW_REPO_MGR` after sourcing `set_env.sh`.
 
 ## The `is_main_package` flag
 
-Exactly one package per repo should set `is_main_package: true`. This designates it as the
-**main package** — the config anchor for the generated repo. `fw-repo-mgr` uses this flag to:
+Every repo **must** resolve to exactly one main package. `fw-repo-mgr` resolves it in order:
+
+1. `config_package: <pkg>` on the repo entry — explicit override, takes precedence over all
+2. `is_main_package: true` on any `framework_packages` entry — explicit annotation
+3. The single embedded package, if exactly one exists — implicit default, no annotation required
+
+If none of the above applies (zero embedded packages, or multiple embedded with none annotated),
+`fw-repo-mgr --validate` and `fw-repo-mgr --build` both fail with:
+
+```
+ERROR: repos_must_have_main_package: '<repo>' has multiple embedded packages [...] with none marked is_main_package: true
+```
+
+Enforce this check by adding to `framework_package_naming_rules`:
+
+```yaml
+- name: repos_must_have_main_package
+  value: true
+```
+
+`fw-repo-mgr` uses the resolved main package to:
 
 1. Write `config/_framework.yaml` with `main_package: <pkg>` — the bootstrap file `set_env.sh`
    reads on every source to export `_FRAMEWORK_MAIN_PACKAGE` and `_FRAMEWORK_MAIN_PACKAGE_DIR`
 2. Copy `_framework_settings/` files into `infra/<pkg>/_config/_framework_settings/`
 3. Apply `framework_settings_template` overrides (e.g. shared GCS backend) into that directory
 4. Write `framework_packages.yaml` into `infra/<pkg>/_config/_framework_settings/`
-
-If no package declares `is_main_package: true` and there is exactly one embedded package,
-that package is used implicitly. If there are multiple embedded packages and none declares
-the flag, `fw-repo-mgr` errors out.
 
 See [config-files.md](config-files.md#configframeworkyaml----the-one-true-anchor) for what
 `main_package` means at runtime — three-tier config lookup, env vars, and discovery.
@@ -75,7 +90,7 @@ framework_repos:
   - name: de3-my-new-pkg-repo
     local_only: true          # ← remove this line once you're happy with the local repo
     source_repo:
-      name: de3-runner
+      name: de3-framework-pkg-repo
     new_repo_config:
       git-remotes:
         - name: origin

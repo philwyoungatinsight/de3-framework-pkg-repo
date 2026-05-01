@@ -85,6 +85,7 @@ framework_repo_manager:
   #   package_names_must_be_unique                 value: true
   #   package_names_must_be_valid_identifiers      value: true   (enforces -pkg suffix)
   #   package_names_must_not_contain_special_chars value: true
+  #   repos_must_have_main_package                 value: true   (every repo must resolve a main package)
   framework_package_naming_rules:
     - name: repo_names_must_be_unique
       value: true
@@ -99,6 +100,8 @@ framework_repo_manager:
     - name: package_names_must_be_valid_identifiers
       value: true
     - name: package_names_must_not_contain_special_chars
+      value: true
+    - name: repos_must_have_main_package
       value: true
 
 
