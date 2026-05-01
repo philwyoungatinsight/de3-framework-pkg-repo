@@ -54,6 +54,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).parents[1] / "_utilities" / "python"))
+from framework_config import find_framework_config_dirs, load_framework_config  # noqa: E402
+
 try:
     import yaml
 except ImportError:
@@ -234,27 +237,17 @@ def make_fetcher(backend_type: str, backend_config: dict, stack_root: str) -> St
 # YAML config loading and ancestor-merge (mirrors root.hcl logic)
 # ---------------------------------------------------------------------------
 
-def load_stack_config(path: str) -> dict:
+def load_stack_config(path) -> dict:
     """Load framework config and return a flat dict of framework keys.
 
-    Accepts either a directory (reads all framework_*.yaml files) or a single
-    YAML file (legacy single-file format).
+    Accepts a list of Path dirs (all three tiers, lowest-to-highest priority),
+    a single directory path str/Path, or a single YAML file (legacy).
     """
+    if isinstance(path, list):
+        return load_framework_config(path)
     p = Path(path)
     if p.is_dir():
-        result: dict = {}
-        for f in sorted(p.glob("framework_*.yaml")):
-            if "secrets" in f.name:
-                continue
-            try:
-                raw = yaml.safe_load(f.read_text())
-            except yaml.YAMLError:
-                continue
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    if k.startswith("framework_"):
-                        result[k[len("framework_"):]] = v
-        return result
+        return load_framework_config([p])
     # Legacy: single file
     with open(path) as fh:
         raw = yaml.safe_load(fh)
@@ -857,12 +850,11 @@ def resolve_config_path(explicit: Optional[str]) -> str:
             "ERROR: $_INFRA_DIR is not set. "
             "Run: source $(git rev-parse --show-toplevel)/set_env.sh"
         )
-    git_root = str(Path(infra_dir).parent)
-    # Primary location: split framework_*.yaml files in infra/_framework-pkg/_config/
-    config_dir = os.path.join(git_root, "infra", "_framework-pkg", "_config")
-    if os.path.isdir(config_dir) and any(Path(config_dir).glob("framework_*.yaml")):
-        return config_dir
-    sys.exit("ERROR: could not find framework_*.yaml files in infra/_framework-pkg/_config/")
+    git_root = Path(infra_dir).parent
+    try:
+        return find_framework_config_dirs(git_root)
+    except FileNotFoundError as e:
+        sys.exit(f"ERROR: {e}")
 
 
 def resolve_stack_root(explicit: Optional[str]) -> str:

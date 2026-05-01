@@ -27,7 +27,7 @@ $_FW_REPO_MGR --status
 For each target repo in `framework_repos`:
 
 1. **Clone or update** from the configured `source_repo` (rsync for new repos, fetch/pull for existing)
-2. **Prune** `infra/` — removes real dirs not in the embedded package list
+2. **Prune** `infra/` — removes real dirs not in the embedded package list; removes `.gitlab-ci.yml` if it is now a dangling symlink (default-pkg is always pruned)
 3. **Write scaffolding** — `config/_framework.yaml`, `framework_packages.yaml`, `_framework_settings/` files
 4. **Re-encrypt** any `*.sops.yaml` files using the new `.sops.yaml` keys (via `sops-mgr`)
 5. **Sync packages** — runs `pkg-mgr --sync` inside the target repo to create external package symlinks

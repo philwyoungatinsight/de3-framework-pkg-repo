@@ -5,6 +5,15 @@ Individual logs deleted after consolidation here.
 
 ---
 
+## 2026-05-01 — Fix pre-apply GCS unlock, generate-inventory config path, fw-repo-mgr .gitlab-ci.yml
+
+- `wave-mgr` pre-apply GCS unlock was a no-op: `get_wave_unit_prefixes` only scanned `providers[*].config_params`; package-level `config_params` (the format pwy-home-lab-pkg uses) was never checked, so prefixes were always empty and locks were never cleared
+- `generate_ansible_inventory.py`: hard-coded path `infra/_framework-pkg/_config/` missed `_framework_settings/` subdir and the main package tier; replaced with `find_framework_config_dirs` so all three tiers load correctly
+- `fw-repo-mgr`: after `prune_infra()` removes `default-pkg`, `.gitlab-ci.yml` is now a dangling symlink — added post-prune cleanup to remove it; existing 13 generated repos cleaned up by one-off `git rm` loop
+- `is_config_package` renamed to `is_main_package` in scanner.py and docs
+
+---
+
 ## 2026-04-26 — Right-click context menu on Framework Repos canvas
 
 - Removed left-click git URL opening from Mermaid class diagram nodes (was triggering accidentally during canvas drag)

@@ -269,6 +269,11 @@ def load_all_configs() -> dict:
                 wave['_pkg'] = pkg_name  # internal tracking, stripped before use
                 all_wave_defs[wave_name] = wave
 
+        # Merge package-level config_params into cfg (used for pre-apply lock key computation)
+        for key, params in (pkg_cfg.get('config_params') or {}).items():
+            if isinstance(params, dict):
+                cfg.setdefault('config_params', {})[key] = params
+
         # Merge providers into cfg (used for pre-apply lock key computation)
         for prov_name, prov_data in pkg_cfg.get('providers', {}).items():
             cfg.setdefault('providers', {}).setdefault(prov_name, {})
@@ -336,6 +341,9 @@ def get_wave_unit_prefixes(cfg: dict, wave_name: str) -> list:
     """Return GCS path prefixes for config_params keys whose _wave matches wave_name.
     A parent-key prefix (e.g. unifi-pkg/_stack/unifi/pwy-homelab/) covers all child units."""
     prefixes = []
+    for key, params in cfg.get('config_params', {}).items():
+        if isinstance(params, dict) and params.get('_wave') == wave_name:
+            prefixes.append(key + '/')
     for provider_cfg in cfg.get('providers', {}).values():
         for key, params in provider_cfg.get('config_params', {}).items():
             if isinstance(params, dict) and params.get('_wave') == wave_name:
