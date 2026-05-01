@@ -5,6 +5,14 @@ Individual logs deleted after consolidation here.
 
 ---
 
+## 2026-05-01 — Fix fw-repo-mgr pkg-mgr sync shim: use caller's _FRAMEWORK_PKG_DIR
+
+- `fw-repo-mgr` `build_repo()` step 4 shim exported `_FRAMEWORK_PKG_DIR` pointing at the target repo's `infra/_framework-pkg` — a dangling symlink before sync runs
+- Fixed to bake in the caller's `_FRAMEWORK_PKG_DIR` (always valid) so `pkg-mgr` can locate `framework_packages.yaml` via its fallback config lookup
+- Root cause: `pkg-mgr` sources `set_env.sh` first; the shim's dangling path caused `_fw_cfg()` to fail finding `framework_packages.yaml`
+
+---
+
 ## 2026-05-01 — Fix pre-apply GCS unlock, generate-inventory config path, fw-repo-mgr .gitlab-ci.yml
 
 - `wave-mgr` pre-apply GCS unlock was a no-op: `get_wave_unit_prefixes` only scanned `providers[*].config_params`; package-level `config_params` (the format pwy-home-lab-pkg uses) was never checked, so prefixes were always empty and locks were never cleared
