@@ -67,35 +67,29 @@ fires. Minimum required dummy values: `_env: example`, `_region: example-lab`,
 
 ## Open Questions
 
-1. **`_skip_on_build` direction**: The task description says "set `_skip_on_build: false`
-   so that it will not be run". But `_skip_on_build: false` means the unit IS included in
-   builds. Should examples be **excluded** from `./run --apply` by default (`true`), or
-   **included** (`false`)? This plan assumes `true` (excluded) — the same behaviour as
-   mikrotik's example and GCP's stack. Please confirm.
+1. **`_skip_on_build: true`** — examples excluded from `./run --apply` by default. ✓
 
-2. **GCP restructure**: All current units in `gcp-pkg/_stack/gcp/` are examples. Should
-   they be moved into `gcp-pkg/_stack/gcp/examples-archive/example-lab/...` (requires
-   renaming directories and updating config_params paths), or should `examples-archive`
-   remain a separate subdirectory alongside the existing units (and the existing units
-   stay in place)? **Option A** (restructure) is cleaner but more invasive.
+2. **GCP restructure** — keep existing unit dirs in place (all already have `_skip_on_build: true`
+   at the `gcp-pkg/_stack/gcp:` ancestor). Just add `examples-archive/.gitkeep` alongside
+   the existing units. No directory renames needed. ✓
 
-3. **Existing `examples/` dirs**: All the empty `examples/` gitkeep dirs should be
-   **renamed** to `examples-archive/`. Confirmed?
+3. **Old `examples/` dirs** — remove (git rm), but only after verifying no content is lost.
+   All current `examples/` dirs contain only `.gitkeep` except mikrotik which is being moved.
+   Safe to remove. ✓
 
-4. **Mikrotik `example-lab`**: The existing mikrotik example at
-   `mikrotik-pkg/_stack/routeros/example-lab/` should be moved to
-   `mikrotik-pkg/_stack/routeros/examples-archive/example-lab/`. The config_params path
-   `mikrotik-pkg/_stack/routeros/example-lab:` becomes
-   `mikrotik-pkg/_stack/routeros/examples-archive:`. Confirmed?
+4. **Mikrotik rename** — `routeros/example-lab/` → `routeros/examples-archive/example-lab/`
+   via `git mv`. Config path `mikrotik-pkg/_stack/routeros/example-lab:` split into
+   `examples-archive:` (parent with `_skip_on_build: true`) and `examples-archive/example-lab:`
+   (child with region/endpoint params). ✓
 
-5. **Maas/proxmox/mesh-central/image-maker examples complexity**: These packages require
-   other infrastructure to work (Proxmox cluster, MaaS server, network). Should the
-   examples show the full resource config (with placeholder values for all required params)
-   even though the example can't stand alone, or should they be simplified / documented
-   as "reference only"?
+5. **Examples are fully runnable** — each example must contain enough config to be
+   **copied into a new deployment repo (like pwy-home-lab-pkg) and run after filling in
+   credentials/IPs**. Each package already declares its dependencies in `framework_packages.yaml`
+   (`_requires_capability`), so the example assumes those dependent packages are present.
+   Config values should be realistic (based on pwy-home-lab-pkg structure) with `example-lab`
+   naming and placeholder IPs/MACs/credentials clearly marked. ✓
 
-6. **Framework docs update**: Should `infra/_framework-pkg/_docs/framework/skip-parameters.md`
-   be updated to use `examples-archive` in its code samples (currently shows `examples/`)?
+6. **Framework docs** — update `skip-parameters.md` to use `examples-archive` naming. ✓
 
 ---
 
