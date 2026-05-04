@@ -100,8 +100,10 @@ _ensure_cloned() {
     fi
   fi
   mkdir -p "$EXT_PACKAGES_DIR/$slug"
-  ln -sfn "$ext_clone" "$dest"
-  echo "Linked: _ext_packages/$slug/$ref_dir -> $ext_clone"
+  local rel_target
+  rel_target=$(python3 -c "import os.path; print(os.path.relpath('$ext_clone', os.path.dirname('$dest')))")
+  ln -sfn "$rel_target" "$dest"
+  echo "Linked: _ext_packages/$slug/$ref_dir -> $rel_target (relative)"
 }
 
 _create_symlink() {
