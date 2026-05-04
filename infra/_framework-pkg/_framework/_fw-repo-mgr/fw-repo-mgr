@@ -4,7 +4,7 @@
 Creates and maintains de3 framework ecosystem repos from a template source repo.
 Configuration is read from framework_repo_manager.yaml via 3-tier lookup:
   1. $GIT_ROOT/config/framework_repo_manager.yaml              (ad-hoc override)
-  2. $_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/ (main package)
+  2. $_MAIN_PKG_DIR/_config/_framework_settings/ (main package)
   3. $_FRAMEWORK_PKG_DIR/_config/_framework_settings/          (framework default)
 """
 
@@ -28,11 +28,9 @@ except ImportError:
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 def _git_root() -> str:
-    # Prefer $_GIT_ROOT already in the environment (parent shell sourced set_env.sh).
-    # This is authoritative and avoids the symlink-resolution problem: os.getcwd() and
-    # git both resolve to the physical framework repo, not the consumer repo.
-    if os.environ.get("_GIT_ROOT"):
-        return os.environ["_GIT_ROOT"]
+    fw_pkg = os.environ.get("_FRAMEWORK_PKG_DIR")
+    if fw_pkg:
+        return str(pathlib.Path(fw_pkg).parent.parent)
     # Walk up from logical $PWD (shell's unresolved path) as a fallback.
     pwd = pathlib.Path(os.environ.get("PWD") or os.getcwd())
     p = pwd
@@ -49,13 +47,13 @@ def _git_root() -> str:
 def _source_set_env(git_root: str) -> None:
     """Ensure framework environment variables are available in os.environ.
 
-    If the parent shell already sourced set_env.sh (_GIT_ROOT and _FRAMEWORK_PKG_DIR
+    If the parent shell already sourced set_env.sh (_FRAMEWORK_PKG_DIR and _UTILITIES_DIR
     are present), re-use those vars directly.  Spawning a subprocess would call
     git rev-parse inside set_env.sh, resolve symlinks, and find the physical
-    framework repo instead of the consumer repo — setting _FRAMEWORK_MAIN_PACKAGE_DIR
+    framework repo instead of the consumer repo — setting _MAIN_PKG_DIR
     to the wrong location.
     """
-    if os.environ.get("_GIT_ROOT") and os.environ.get("_FRAMEWORK_PKG_DIR"):
+    if os.environ.get("_FRAMEWORK_PKG_DIR") and os.environ.get("_UTILITIES_DIR"):
         return
     set_env = pathlib.Path(git_root) / "set_env.sh"
     if not set_env.exists():
@@ -96,7 +94,7 @@ class Config:
         if self._path_loaded:
             return self._path
         self._path_loaded = True
-        fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+        fw_main = _env("_MAIN_PKG_DIR")
         fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
         candidates = [
             self.git_root / "config" / _CFG_FNAME,
@@ -170,7 +168,7 @@ class Config:
         return embedded[0] if len(embedded) == 1 else ""
 
     def ext_pkg_base(self) -> str:
-        fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+        fw_main = _env("_MAIN_PKG_DIR")
         fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
         for candidate in [
             self.git_root / "config" / _PKG_MGMT_FNAME,
@@ -483,7 +481,7 @@ def copy_framework_settings(repo_dir: pathlib.Path, config_pkg: str) -> None:
         r"framework_package_management|framework_repo_manager)\.yaml$"
     )
     fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
-    fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    fw_main = _env("_MAIN_PKG_DIR")
     seen: set = set()
     src_dirs = []
     for base in [fw_pkg, fw_main]:
@@ -552,7 +550,7 @@ def write_minimal_framework_settings(
         f"framework_package_repositories:\n  - name: de3-runner\n    url: {source_url}\n"
     )
 
-    fw_main = _env("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    fw_main = _env("_MAIN_PKG_DIR")
     fw_pkg  = _env("_FRAMEWORK_PKG_DIR")
     for base in [fw_main, fw_pkg]:
         if not base:
@@ -672,12 +670,10 @@ def build_repo(repo_name: str, force_push: bool, cfg: Config) -> None:
         caller_fw_pkg_dir = os.environ.get("_FRAMEWORK_PKG_DIR", "")
         set_env_link.write_text(
             "#!/bin/bash\n"
-            '_SHIM_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"\n'
+            '_SHIM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
             f'export _FRAMEWORK_PKG_DIR="{caller_fw_pkg_dir}"\n'
             f'export _FRAMEWORK_MAIN_PACKAGE="{config_pkg}"\n'
-            f'export _FRAMEWORK_MAIN_PACKAGE_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
-            f'export _FRAMEWORK_CONFIG_PKG="{config_pkg}"\n'
-            f'export _FRAMEWORK_CONFIG_PKG_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
+            f'export _MAIN_PKG_DIR="$_SHIM_ROOT/infra/{config_pkg}"\n'
             'export _GCS_BUCKET=""\n'
             'export _CONFIG_TMP_DIR="$_SHIM_ROOT/config/tmp"\n'
             'export _DYNAMIC_DIR="$_SHIM_ROOT/config/tmp/dynamic"\n'

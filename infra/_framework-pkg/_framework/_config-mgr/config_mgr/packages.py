@@ -16,7 +16,7 @@ def _fw_cfg_path(repo_root: Path, filename: str) -> Path:
     override = repo_root / "config" / filename
     if override.exists():
         return override
-    config_pkg_dir = os.environ.get("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    config_pkg_dir = os.environ.get("_MAIN_PKG_DIR")
     if config_pkg_dir:
         candidate = Path(config_pkg_dir) / "_config" / "_framework_settings" / filename
         if candidate.exists():

@@ -19,7 +19,7 @@ function handle_error {
 trap handle_error ERR
 
 # Set Config variables
-. ${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh
+. "${_FRAMEWORK_PKG_DIR:?_FRAMEWORK_PKG_DIR must be set before sourcing framework-utils.sh}/../../set_env.sh"
 
 ################################################################################
 # Functions
@@ -78,7 +78,7 @@ function _find_component_config() {
         return 1
     fi
     local git_root candidate
-    git_root="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
+    git_root="$(dirname "$(dirname "$_FRAMEWORK_PKG_DIR")")"
     # Check framework config/ first
     for f in "${git_root}/config/${key_name}.yaml" "${git_root}/config/${key_name}.sops.yaml"; do
         if [[ -f "$f" ]]; then

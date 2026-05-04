@@ -22,7 +22,7 @@ def find_framework_config_dirs(root: Path) -> list[Path]:
 
     Search order (lowest to highest priority):
       1. infra/_framework-pkg/_config/defaults/        framework defaults
-      2. infra/$_FRAMEWORK_MAIN_PACKAGE/_config/overrides/  main package overrides (if set)
+      2. infra/$_FRAMEWORK_MAIN_PACKAGE/_config/overrides/  main package overrides (via $_MAIN_PKG_DIR)
       3. config/                                        ad-hoc/dev overrides
 
     Files in later dirs override same-named keys from earlier dirs.
@@ -34,7 +34,7 @@ def find_framework_config_dirs(root: Path) -> list[Path]:
     if fw_cfg.is_dir():
         dirs.append(fw_cfg)
 
-    config_pkg_dir = os.environ.get("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    config_pkg_dir = os.environ.get("_MAIN_PKG_DIR")
     if config_pkg_dir:
         pkg_cfg = Path(config_pkg_dir) / "_config" / "_framework_settings"
         if pkg_cfg.is_dir() and pkg_cfg not in dirs:
@@ -59,7 +59,7 @@ def fw_cfg_path(root: Path, filename: str) -> Path:
 
     Priority (highest first):
       1. <root>/config/<filename>                                     per-dev override
-      2. $_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/<filename>  main package
+      2. $_MAIN_PKG_DIR/_config/_framework_settings/<filename>  main package
       3. $_FRAMEWORK_PKG_DIR/_config/_framework_settings/<filename>          framework default
 
     Returns the path of the highest-priority file that exists, falling back to
@@ -68,7 +68,7 @@ def fw_cfg_path(root: Path, filename: str) -> Path:
     override = root / "config" / filename
     if override.exists():
         return override
-    config_pkg_dir = os.environ.get("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    config_pkg_dir = os.environ.get("_MAIN_PKG_DIR")
     if config_pkg_dir:
         candidate = Path(config_pkg_dir) / "_config" / "_framework_settings" / filename
         if candidate.exists():

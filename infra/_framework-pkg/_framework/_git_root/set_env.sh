@@ -5,30 +5,37 @@
 #   source "$(git rev-parse --show-toplevel)/set_env.sh"
 #
 # On every source it:
-#   1. Exports path variables (_GIT_ROOT, tool paths, dynamic dirs, GCS bucket)
+#   1. Exports path variables (_FRAMEWORK_PKG_DIR, _MAIN_PKG_DIR, tool paths, dynamic dirs, GCS bucket)
 #   2. Creates the dynamic runtime directories under config/tmp/dynamic/
 #   3. Runs `config-mgr generate` to pre-merge all package YAML and copy encrypted
 #      SOPS files into $_CONFIG_DIR (Terragrunt decrypts secrets at runtime via
 #      sops_decrypt_file — no secret is written to disk in plaintext)
 
-# Idempotent: already sourced if _GIT_ROOT and _UTILITIES_DIR are both set.
-[[ -n "${_GIT_ROOT:-}" && -n "${_UTILITIES_DIR:-}" ]] && return 0
+# Idempotent: already sourced if _FRAMEWORK_PKG_DIR and _UTILITIES_DIR are both set.
+[[ -n "${_FRAMEWORK_PKG_DIR:-}" && -n "${_UTILITIES_DIR:-}" ]] && return 0
 
 _set_env_export_vars() {
-    # --- Repository root paths ---
-    # Everything is derived from _GIT_ROOT so this script works from any subdirectory.
-    # Use BASH_SOURCE[0] (the path of set_env.sh itself) rather than `git rev-parse` so
-    # that this works correctly when sourced from inside a symlinked directory that belongs
-    # to a different git repo (e.g. an embedded package checkout). set_env.sh lives at the
-    # deployment repo root by convention, so dirname of its sourced path is always correct.
-    _GIT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -z "$_GIT_ROOT" ]; then
-        echo "FATAL: could not determine git root from BASH_SOURCE." >&2; return 1
+    # ── Primary anchors ─────────────────────────────────────────────────────────
+    # _FRAMEWORK_PKG_DIR is derived from BASH_SOURCE[0] (the path of set_env.sh
+    # itself, which is always a symlink at the consumer repo root). This avoids
+    # git rev-parse and works correctly from any subdirectory or symlinked context.
+    # If already set (e.g. by a bash tool wrapper that cd's before running Python),
+    # the existing value is kept and trusted.
+    if [[ -z "${_FRAMEWORK_PKG_DIR:-}" ]]; then
+        local _boot_root
+        _boot_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [[ -z "$_boot_root" ]]; then
+            echo "FATAL: could not determine repo root from BASH_SOURCE." >&2; return 1
+        fi
+        export _FRAMEWORK_PKG_DIR="$_boot_root/infra/_framework-pkg"
     fi
-    export _GIT_ROOT
 
-    export _INFRA_DIR="$_GIT_ROOT/infra"
-    export _FRAMEWORK_PKG_DIR="$_INFRA_DIR/_framework-pkg"
+    # Internal repo root — derived from _FRAMEWORK_PKG_DIR, NOT exported.
+    # All new code should reference _FRAMEWORK_PKG_DIR (or _MAIN_PKG_DIR) directly.
+    local _repo_root
+    _repo_root="$(dirname "$(dirname "$_FRAMEWORK_PKG_DIR")")"
+
+    export _INFRA_DIR="$(dirname "$_FRAMEWORK_PKG_DIR")"
     export _FRAMEWORK_DIR="$_FRAMEWORK_PKG_DIR/_framework"    # framework tool source
 
     # --- Framework tool paths ---
@@ -56,7 +63,7 @@ _set_env_export_vars() {
     # --- Runtime dynamic directories ---
     # All generated/runtime files go under config/tmp/dynamic/ so they are gitignored
     # and survive across shell sessions. Subdirs are created by _set_env_create_dirs.
-    export _CONFIG_TMP_DIR="$_GIT_ROOT/config/tmp"
+    export _CONFIG_TMP_DIR="$_repo_root/config/tmp"
     export _DYNAMIC_DIR="$_CONFIG_TMP_DIR/dynamic"
     export _RAMDISK_DIR="$_DYNAMIC_DIR/ramdisk"               # RAM-backed scratch space (managed by _RAMDISK_MGR)
     export _WAVE_LOGS_DIR="$_DYNAMIC_DIR/run-wave-logs"      # per-wave apply/test log files
@@ -67,37 +74,29 @@ _set_env_export_vars() {
     # config/_framework.yaml declares which package is the "main package" — the deployment-
     # specific package that overrides framework defaults (e.g. pwy-home-lab-pkg).
     # A pre-existing _FRAMEWORK_MAIN_PACKAGE env var wins (for CI or per-dev overrides).
-    # _FRAMEWORK_CONFIG_PKG is accepted as a legacy alias for one release cycle.
-    # Python is used because bash cannot parse YAML reliably.
-    if [[ -z "${_FRAMEWORK_MAIN_PACKAGE:-}" && -n "${_FRAMEWORK_CONFIG_PKG:-}" ]]; then
-        _FRAMEWORK_MAIN_PACKAGE="$_FRAMEWORK_CONFIG_PKG"
-    fi
     if [[ -z "${_FRAMEWORK_MAIN_PACKAGE:-}" ]]; then
         export _FRAMEWORK_MAIN_PACKAGE
-        _FRAMEWORK_MAIN_PACKAGE="$(python3 "$_FRAMEWORK_DIR/_utilities/python/read-set-env.py" config-pkg "$_GIT_ROOT")"
+        _FRAMEWORK_MAIN_PACKAGE="$(python3 "$_FRAMEWORK_DIR/_utilities/python/read-set-env.py" config-pkg "$_repo_root")"
     fi
-    export _FRAMEWORK_MAIN_PACKAGE_DIR=""
+    export _MAIN_PKG_DIR=""
     if [[ -n "${_FRAMEWORK_MAIN_PACKAGE:-}" ]]; then
-        export _FRAMEWORK_MAIN_PACKAGE_DIR
-        _FRAMEWORK_MAIN_PACKAGE_DIR="$(realpath "$_INFRA_DIR/$_FRAMEWORK_MAIN_PACKAGE" 2>/dev/null || echo "$_INFRA_DIR/$_FRAMEWORK_MAIN_PACKAGE")"
+        export _MAIN_PKG_DIR
+        _MAIN_PKG_DIR="$(realpath "$_INFRA_DIR/$_FRAMEWORK_MAIN_PACKAGE" 2>/dev/null || echo "$_INFRA_DIR/$_FRAMEWORK_MAIN_PACKAGE")"
     fi
-    # Legacy aliases — deprecated; will be removed in a future release
-    export _FRAMEWORK_CONFIG_PKG="$_FRAMEWORK_MAIN_PACKAGE"
-    export _FRAMEWORK_CONFIG_PKG_DIR="$_FRAMEWORK_MAIN_PACKAGE_DIR"
 
     # --- GCS state backend (3-tier lookup) ---
     # Priority (highest → lowest):
     #   1. config/framework_backend.yaml            — ad-hoc per-developer override
-    #   2. infra/$_FRAMEWORK_MAIN_PACKAGE/_config/_framework_settings/framework_backend.yaml
+    #   2. $_MAIN_PKG_DIR/_config/_framework_settings/framework_backend.yaml
     #                                               — deployment main package (e.g. pwy-home-lab-pkg)
-    #   3. infra/_framework-pkg/_config/_framework_settings/framework_backend.yaml
+    #   3. $_FRAMEWORK_PKG_DIR/_config/_framework_settings/framework_backend.yaml
     #                                               — framework default (always present)
     local _fw_backend
-    if [[ -f "$_GIT_ROOT/config/framework_backend.yaml" ]]; then
-        _fw_backend="$_GIT_ROOT/config/framework_backend.yaml"
-    elif [[ -n "${_FRAMEWORK_MAIN_PACKAGE_DIR:-}" && \
-            -f "$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/framework_backend.yaml" ]]; then
-        _fw_backend="$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/framework_backend.yaml"
+    if [[ -f "$_repo_root/config/framework_backend.yaml" ]]; then
+        _fw_backend="$_repo_root/config/framework_backend.yaml"
+    elif [[ -n "${_MAIN_PKG_DIR:-}" && \
+            -f "$_MAIN_PKG_DIR/_config/_framework_settings/framework_backend.yaml" ]]; then
+        _fw_backend="$_MAIN_PKG_DIR/_config/_framework_settings/framework_backend.yaml"
     else
         _fw_backend="$_FRAMEWORK_PKG_DIR/_config/_framework_settings/framework_backend.yaml"
     fi

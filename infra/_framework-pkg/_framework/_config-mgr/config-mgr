@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-
-. "${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh"
+export _FRAMEWORK_PKG_DIR="${_FRAMEWORK_PKG_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+. "$_FRAMEWORK_PKG_DIR/../../set_env.sh"
 . "$_UTILITIES_DIR/bash/init.sh"
 
 export PYTHON_VERSION='python3.12'

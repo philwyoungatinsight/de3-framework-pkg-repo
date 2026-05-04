@@ -6,7 +6,7 @@
 # and cached at $_DYNAMIC_DIR/maas-state/maas-state.yaml.
 #
 # Usage in bash scripts:
-#   . "$(_GIT_ROOT)/utilities/bash/maas-state-cache.sh"
+#   . "$_FRAMEWORK_PKG_DIR/../../utilities/bash/maas-state-cache.sh"
 #   ensure_maas_state_fresh                    # fetch if stale (uses _MAAS_HOST from env or config)
 #   ensure_maas_state_fresh 10.0.10.11 60      # explicit host and TTL
 #   maas_state_file                            # echo path to cache file
@@ -23,15 +23,15 @@
 # Environment variables read:
 #   _MAAS_STATE_CACHE_TTL   cache lifetime in seconds (default: 120)
 #   _DYNAMIC_DIR            set by set_env.sh
-#   _GIT_ROOT               set by set_env.sh (or git rev-parse --show-toplevel)
+#   _FRAMEWORK_PKG_DIR      set by set_env.sh (or derived from script location)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 _maas_state_git_root() {
-    if [[ -n "${_GIT_ROOT:-}" ]]; then
-        echo "$_GIT_ROOT"
+    if [[ -n "${_FRAMEWORK_PKG_DIR:-}" ]]; then
+        dirname "$(dirname "$_FRAMEWORK_PKG_DIR")"
     else
         git rev-parse --show-toplevel
     fi

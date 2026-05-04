@@ -12,7 +12,7 @@ def _fw_cfg_path(repo_root: Path, filename: str) -> Path:
     override = repo_root / "config" / filename
     if override.exists():
         return override
-    config_pkg_dir = os.environ.get("_FRAMEWORK_MAIN_PACKAGE_DIR")
+    config_pkg_dir = os.environ.get("_MAIN_PKG_DIR")
     if config_pkg_dir:
         candidate = Path(config_pkg_dir) / "_config" / "_framework_settings" / filename
         if candidate.exists():
@@ -22,12 +22,9 @@ def _fw_cfg_path(repo_root: Path, filename: str) -> Path:
 
 
 def repo_root() -> Path:
-    # Prefer _GIT_ROOT from set_env.sh (the consumer repo root) — the tool binary
-    # cd's into the framework dir before running Python, so git-rev-parse would
-    # resolve to the framework repo clone, not the consumer repo.
-    env_root = os.environ.get("_GIT_ROOT")
-    if env_root:
-        return Path(env_root)
+    fw_pkg = os.environ.get("_FRAMEWORK_PKG_DIR")
+    if fw_pkg:
+        return Path(fw_pkg).parent.parent
     r = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, check=True,

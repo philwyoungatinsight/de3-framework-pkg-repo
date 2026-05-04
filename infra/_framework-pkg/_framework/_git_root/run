@@ -39,7 +39,7 @@ except ImportError:
     print('ERROR: pyyaml not installed. Run: pip install pyyaml', file=sys.stderr)
     sys.exit(1)
 
-_GIT_ROOT = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+_GIT_ROOT = Path(__file__).parent.resolve()
 
 # ── bootstrap ──────────────────────────────────────────────────────────────────
 

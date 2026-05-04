@@ -55,7 +55,7 @@ locals {
   # Package config:   providers, config_params, wave definitions.
   # Secrets:          per-package encrypted SOPS file copy in _CONFIG_DIR (decrypted at runtime).
   # ---------------------------------------------------------------------------
-  _framework_main_package_dir = get_env("_FRAMEWORK_MAIN_PACKAGE_DIR", "")
+  _framework_main_package_dir = get_env("_MAIN_PKG_DIR", "")
   _fw_backend_path = (
     fileexists("${local.stack_root}/config/framework_backend.yaml")
     ? "${local.stack_root}/config/framework_backend.yaml"

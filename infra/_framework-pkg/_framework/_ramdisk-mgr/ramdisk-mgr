@@ -27,6 +27,9 @@
 # changed parameters (size, mode, owner) are applied in-place without touching disk.
 set -euo pipefail
 
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export _FRAMEWORK_PKG_DIR="${_FRAMEWORK_PKG_DIR:-$(cd "$_SCRIPT_DIR/../.." && pwd)}"
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -63,8 +66,8 @@ done
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "setup" ]]; then
-    GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
-    source "$GIT_ROOT/set_env.sh"
+    GIT_ROOT="$(dirname "$(dirname "$_FRAMEWORK_PKG_DIR")")"
+    source "$_FRAMEWORK_PKG_DIR/../../set_env.sh"
 
     if [[ "${CI:-}" == "true" ]] || ! tty -s 2>/dev/null; then
         echo "ramdisk-mgr: non-interactive context, skipping."
@@ -129,8 +132,8 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "teardown" ]]; then
-    GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
-    source "$GIT_ROOT/set_env.sh"
+    GIT_ROOT="$(dirname "$(dirname "$_FRAMEWORK_PKG_DIR")")"
+    source "$_FRAMEWORK_PKG_DIR/../../set_env.sh"
 
     OS_TYPE=$(uname -s)
 

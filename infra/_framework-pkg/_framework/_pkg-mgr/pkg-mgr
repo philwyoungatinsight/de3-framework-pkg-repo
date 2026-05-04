@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export _FRAMEWORK_PKG_DIR="${_FRAMEWORK_PKG_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+source "$_FRAMEWORK_PKG_DIR/../../set_env.sh"
 
-GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
+GIT_ROOT="$(dirname "$(dirname "$_FRAMEWORK_PKG_DIR")")"
 EXT_PACKAGES_DIR="$GIT_ROOT/_ext_packages"
 INFRA_DIR="$GIT_ROOT/infra"
 
@@ -18,9 +20,9 @@ _fw_cfg() {
   # config/ is highest priority (ad-hoc overrides)
   [[ -f "$GIT_ROOT/config/$name" ]] && { echo "$GIT_ROOT/config/$name"; return; }
   # Named main package overrides (middle tier)
-  if [[ -n "${_FRAMEWORK_MAIN_PACKAGE_DIR:-}" && \
-        -f "$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/$name" ]]; then
-    echo "$_FRAMEWORK_MAIN_PACKAGE_DIR/_config/_framework_settings/$name"; return
+  if [[ -n "${_MAIN_PKG_DIR:-}" && \
+        -f "$_MAIN_PKG_DIR/_config/_framework_settings/$name" ]]; then
+    echo "$_MAIN_PKG_DIR/_config/_framework_settings/$name"; return
   fi
   # _framework-pkg/_config/_framework_settings/ fallback
   echo "$_FRAMEWORK_PKG_DIR/_config/_framework_settings/$name"

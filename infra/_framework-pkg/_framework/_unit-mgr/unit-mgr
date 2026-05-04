@@ -14,11 +14,12 @@ function handle_error {
 }
 trap handle_error ERR
 
-# Set Config variables
-. ${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh
-
 # Path to this script
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Set Config variables
+export _FRAMEWORK_PKG_DIR="${_FRAMEWORK_PKG_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+. "$_FRAMEWORK_PKG_DIR/../../set_env.sh"
 
 # Utility functions
 . $_UTILITIES_DIR/bash/init.sh
