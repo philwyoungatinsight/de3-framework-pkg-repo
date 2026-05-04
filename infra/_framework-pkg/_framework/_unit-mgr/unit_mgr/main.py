@@ -36,6 +36,12 @@ from .unit_tree import UnitInfo, collect_units, copy_tree, delete_tree
 
 def _repo_root() -> Path:
     """Return the absolute path to the git repo root."""
+    # Prefer _GIT_ROOT from environment (set by set_env.sh). The unit-mgr script
+    # cd's to the framework repo directory before invoking this module, so
+    # git rev-parse --show-toplevel would return the framework repo root, not the
+    # consumer repo root.
+    if env_root := os.environ.get("_GIT_ROOT"):
+        return Path(env_root)
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, check=True,

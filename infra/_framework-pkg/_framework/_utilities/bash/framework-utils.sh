@@ -78,7 +78,7 @@ function _find_component_config() {
         return 1
     fi
     local git_root candidate
-    git_root="$(git rev-parse --show-toplevel)"
+    git_root="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
     # Check framework config/ first
     for f in "${git_root}/config/${key_name}.yaml" "${git_root}/config/${key_name}.sops.yaml"; do
         if [[ -f "$f" ]]; then
