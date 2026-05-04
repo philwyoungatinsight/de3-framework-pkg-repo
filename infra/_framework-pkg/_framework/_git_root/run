@@ -43,25 +43,36 @@ _GIT_ROOT = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel']
 
 # ── bootstrap ──────────────────────────────────────────────────────────────────
 
-_DE3_RUNNER_URL = 'https://github.com/philwyoungatinsight/de3-runner.git'
-_DE3_RUNNER_REF = 'main'
+_FRAMEWORK_PKG_REPO_URL  = 'https://github.com/philwyoungatinsight/de3-framework-pkg-repo.git'
+_FRAMEWORK_PKG_REPO_REF  = 'main'
+_FRAMEWORK_PKG_REPO_SLUG = 'de3-framework-pkg-repo'
 
 
 def _bootstrap():
-    """Clone/update de3-runner and create the infra/_framework-pkg symlink."""
-    clone_dir = _GIT_ROOT / '_ext_packages' / 'de3-runner' / _DE3_RUNNER_REF
+    """Clone/link de3-framework-pkg-repo and create the infra/_framework-pkg symlink."""
+    clone_dir = _GIT_ROOT / '_ext_packages' / _FRAMEWORK_PKG_REPO_SLUG / _FRAMEWORK_PKG_REPO_REF
     link      = _GIT_ROOT / 'infra' / '_framework-pkg'
     clone_dir.parent.mkdir(parents=True, exist_ok=True)
     if not clone_dir.exists():
-        print('==> Bootstrapping _framework-pkg from de3-runner...')
-        subprocess.run(
-            ['git', 'clone', '--branch', _DE3_RUNNER_REF, _DE3_RUNNER_URL, str(clone_dir)],
-            check=True,
-        )
+        # Prefer an already-cloned copy in the external_package_dir (~/git/de3-ext-packages).
+        ext_clone = Path.home() / 'git' / 'de3-ext-packages' / _FRAMEWORK_PKG_REPO_SLUG / _FRAMEWORK_PKG_REPO_REF
+        if ext_clone.exists():
+            rel = os.path.relpath(str(ext_clone), str(clone_dir.parent))
+            if clone_dir.is_symlink():
+                clone_dir.unlink()
+            clone_dir.symlink_to(rel)
+        else:
+            print('==> Bootstrapping _framework-pkg from de3-framework-pkg-repo...')
+            subprocess.run(
+                ['git', 'clone', '--branch', _FRAMEWORK_PKG_REPO_REF,
+                 _FRAMEWORK_PKG_REPO_URL, str(clone_dir)],
+                check=True,
+            )
     else:
-        subprocess.run(['git', '-C', str(clone_dir), 'pull', '--ff-only'], check=False)
-    # Relative symlink: infra/_framework-pkg → ../../_ext_packages/de3-runner/main/infra/_framework-pkg
-    target = Path('../..') / '_ext_packages' / 'de3-runner' / _DE3_RUNNER_REF / 'infra' / '_framework-pkg'
+        if not clone_dir.is_symlink():
+            subprocess.run(['git', '-C', str(clone_dir), 'pull', '--ff-only'], check=False)
+    # Relative symlink: infra/_framework-pkg → ../_ext_packages/de3-framework-pkg-repo/main/infra/_framework-pkg
+    target = Path('..') / '_ext_packages' / _FRAMEWORK_PKG_REPO_SLUG / _FRAMEWORK_PKG_REPO_REF / 'infra' / '_framework-pkg'
     if link.is_symlink():
         link.unlink()
     elif link.exists():
