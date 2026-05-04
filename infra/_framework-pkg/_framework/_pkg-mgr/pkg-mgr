@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(git rev-parse --show-toplevel)/set_env.sh"
+source "${_GIT_ROOT:-$(git rev-parse --show-toplevel)}/set_env.sh"
 
-GIT_ROOT="$(git rev-parse --show-toplevel)"
+GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
 EXT_PACKAGES_DIR="$GIT_ROOT/_ext_packages"
 INFRA_DIR="$GIT_ROOT/infra"
 

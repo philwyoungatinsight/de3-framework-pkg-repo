@@ -82,7 +82,7 @@ except ImportError:
     print('ERROR: pyyaml not installed. Run: pip install pyyaml', file=sys.stderr)
     sys.exit(1)
 
-_GIT_ROOT = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+_GIT_ROOT = Path(os.environ.get('_GIT_ROOT') or subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
 sys.path.insert(0, str(_GIT_ROOT / 'infra' / '_framework-pkg' / '_framework' / '_utilities' / 'python'))
 from framework_config import find_framework_config_dirs, load_framework_config
 
@@ -93,7 +93,7 @@ import gcs_status as _gcs_status
 
 def _source_env() -> dict:
     """Source set_env.sh and return the resulting environment as a dict."""
-    git_root = subprocess.check_output(
+    git_root = os.environ.get('_GIT_ROOT') or subprocess.check_output(
         ['git', 'rev-parse', '--show-toplevel'], text=True
     ).strip()
     raw = subprocess.check_output(

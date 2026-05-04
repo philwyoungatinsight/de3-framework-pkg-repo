@@ -63,7 +63,7 @@ done
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "setup" ]]; then
-    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
     source "$GIT_ROOT/set_env.sh"
 
     if [[ "${CI:-}" == "true" ]] || ! tty -s 2>/dev/null; then
@@ -129,7 +129,7 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "teardown" ]]; then
-    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    GIT_ROOT="${_GIT_ROOT:-$(git rev-parse --show-toplevel)}"
     source "$GIT_ROOT/set_env.sh"
 
     OS_TYPE=$(uname -s)
