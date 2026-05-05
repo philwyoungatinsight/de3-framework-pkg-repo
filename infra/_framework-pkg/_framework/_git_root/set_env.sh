@@ -118,6 +118,7 @@ _set_env_update_path() {
         "$_FRAMEWORK_DIR/_clean_all" \
         "$_FRAMEWORK_DIR/_wave-mgr" \
         "$_FRAMEWORK_DIR/_gpg-mgr" \
+        "$_FRAMEWORK_DIR/_sops-mgr" \
         "$_FRAMEWORK_DIR/_fw-repo-mgr" \
         "$_FRAMEWORK_DIR/_fw_repos_diagram_exporter"; do
         case ":${PATH}:" in
