@@ -54,6 +54,9 @@ from framework_config import find_framework_config_dirs, load_framework_config
 # ---------------------------------------------------------------------------
 
 def _git_root():
+    fw_pkg = os.environ.get("_FRAMEWORK_PKG_DIR")
+    if fw_pkg:
+        return Path(fw_pkg).parent.parent
     r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                        capture_output=True, text=True)
     if r.returncode != 0:

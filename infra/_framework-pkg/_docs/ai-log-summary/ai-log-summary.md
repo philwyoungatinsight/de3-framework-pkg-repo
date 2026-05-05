@@ -5,6 +5,16 @@ Individual logs deleted after consolidation here.
 
 ---
 
+## 2026-05-05 — Standardize set_env.sh bootstrap calls across framework scripts
+
+- Created `set-env-bootstrap-standard.md` documenting four categories (A/B/C/D) with copy-paste examples and quick-reference table
+- `ramdisk-mgr`: renamed `_SCRIPT_DIR` → `SCRIPT_DIR`; moved `set_env.sh` source to top (before arg parsing); removed redundant `GIT_ROOT` + source lines from setup/teardown blocks
+- `write-exit-status`: replaced `git rev-parse` with Category B `${_FRAMEWORK_PKG_DIR:?}` guard pattern
+- `sops-mgr` + `clean-all`: check `_FRAMEWORK_PKG_DIR` env var before falling back to `git rev-parse` (Category D)
+- After fixes: zero `git rev-parse` calls remain in `infra/_framework-pkg/_framework/`
+
+---
+
 ## 2026-05-01 — Fix fw-repo-mgr pkg-mgr sync shim: use caller's _FRAMEWORK_PKG_DIR
 
 - `fw-repo-mgr` `build_repo()` step 4 shim exported `_FRAMEWORK_PKG_DIR` pointing at the target repo's `infra/_framework-pkg` — a dangling symlink before sync runs

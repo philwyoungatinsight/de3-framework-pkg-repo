@@ -12,7 +12,8 @@
 #   .ok-<rel_path_full>        — success marker (written by exit_status_mark_ok,
 #                                 read and deleted by this script)
 set -euo pipefail
-source "$(git rev-parse --show-toplevel)/set_env.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+. "${_FRAMEWORK_PKG_DIR:?_FRAMEWORK_PKG_DIR must be set}/../../set_env.sh"
 
 UNIT_PATH="$1"
 REL_FULL="$2"

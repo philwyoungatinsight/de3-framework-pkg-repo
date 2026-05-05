@@ -18,9 +18,13 @@ from pathlib import Path
 # ── environment ────────────────────────────────────────────────────────────────
 
 def _source_env() -> dict:
-    git_root = subprocess.check_output(
-        ['git', 'rev-parse', '--show-toplevel'], text=True
-    ).strip()
+    _fw_pkg = os.environ.get('_FRAMEWORK_PKG_DIR')
+    if _fw_pkg:
+        git_root = str(Path(_fw_pkg).parent.parent)
+    else:
+        git_root = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'], text=True
+        ).strip()
     raw = subprocess.check_output(
         ['bash', '-c', f'source {git_root}/set_env.sh && env -0'],
         text=True,
