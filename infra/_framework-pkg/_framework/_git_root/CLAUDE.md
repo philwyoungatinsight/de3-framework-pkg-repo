@@ -180,7 +180,7 @@ Create Ansible playbooks in `infra/_framework-pkg/_scripts/ai-only/<task-name>/`
 
 - Structure: `playbook.yaml` + `run` (sources `set_env.sh`, uses `_activate_ansible_locally`)
 - Config from `config_base` YAML (Play 1 on localhost → Play 2 on remote host using `hostvars['localhost']`)
-- File paths: absolute from `GIT_ROOT="$(git rev-parse --show-toplevel)"` — no relative paths
+- File paths: absolute from `GIT_ROOT="$(git rev-parse --show-toplevel)"` — no relative paths (Category C bootstrap — correct for `_scripts/ai-only/`)
 - Export env vars from `run`; use `lookup('env', '_VAR')` in playbooks
 
 **Existing scripts (check before writing new ones):**
@@ -317,7 +317,12 @@ See `infra/_framework-pkg/_docs/framework/waves.md#terraform-dag-vs-wave-orderin
 
 - **GNU argument style**: all scripts must use `-a|--long-arg` GNU convention for CLI arguments — no positional subcommands. Running a script with no arguments must print usage to stderr and exit 1. Bash scripts: use a `while case "$1" in ... esac; shift; done` manual loop (not `getopts`, which doesn't support long args; not `getopt`, which isn't portable to macOS). Python scripts: use `argparse` with `add_argument('-a', '--long-arg', ...)`. Short arg is a single letter, long arg is the descriptive name. Always add `-h|--help`.
 - **Script naming — `run` only when Makefile present**: name the entry-point script `run` only when a sibling `Makefile` exists in the same directory (Makefile targets call `./run`; renaming breaks `make`). For all other scripts — utility tools not called by `make` — use a descriptive name matching the tool directory (e.g. `pkg-mgr`, `unit-mgr`, `config-mgr`, `ramdisk-mgr`, `clean-all`). This makes tools discoverable via `find . -name pkg-mgr`. Exceptions that keep `run`: per-package framework hooks (`infra/<pkg>/_clean_all/run`, `infra/<pkg>/_tg_scripts/…/run`, `scripts/wave-scripts/…/run`) because the framework discovers them by that conventional name.
-- **set_env.sh**: always `source $(git rev-parse --show-toplevel)/set_env.sh` before running terragrunt. Do NOT change existing variables.
+- **set_env.sh bootstrap — category-dependent** (see `infra/_framework-pkg/_docs/set-env-bootstrap-standard.md`):
+  - **Category A** (framework bash entry-points): set `SCRIPT_DIR` + `_FRAMEWORK_PKG_DIR` from `BASH_SOURCE[0]`, source via `. "$_FRAMEWORK_PKG_DIR/../../set_env.sh"` — BEFORE argument parsing. Never use `git rev-parse`.
+  - **Category B** (framework hooks always called by framework, e.g. tg-hooks): `. "${_FRAMEWORK_PKG_DIR:?_FRAMEWORK_PKG_DIR must be set}/../../set_env.sh"`. Never use `git rev-parse`.
+  - **Category C** (consumer standalone scripts: `_setup/`, `_wave_scripts/`, `_tg_scripts/`, `_scripts/ai-only/`): `GIT_ROOT="$(git rev-parse --show-toplevel)" && . "$GIT_ROOT/set_env.sh"`. Safe because these scripts never `cd` into the framework directory.
+  - **Category D** (Python framework entry-points launched by a bash wrapper): check `os.environ.get("_FRAMEWORK_PKG_DIR")` first; derive `git_root = Path(fw_pkg).parent.parent`; fall back to `git rev-parse` only if unset.
+  - **Do NOT change existing variables** already set by set_env.sh.
 - **State backend**: NEVER change to local. Diagnose and fix the actual problem.
 - **Config files**: one top-level key matching the package name (public: `<pkg>`, secrets: `<pkg>_secrets`). Package config lives in `infra/<pkg>/_config/config.yaml` and `infra/<pkg>/_config/secrets.sops.yaml`. No `.cfg` files.
 - **Logging (ai-log)**: write ai-log BEFORE committing. If commit made without log, write as follow-up immediately. File: `infra/pwy-home-lab-pkg/_docs/ai-log/$(date +%Y%m%d%H%M%S)-<short-description>.md`.
