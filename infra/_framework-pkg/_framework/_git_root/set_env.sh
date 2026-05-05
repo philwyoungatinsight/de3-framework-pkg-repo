@@ -1,8 +1,9 @@
 #!/bin/bash
 # Bootstrap script — export all framework environment variables and run startup checks.
 #
-# Source this before running any terragrunt, ansible, or utility command:
-#   source "$(git rev-parse --show-toplevel)/set_env.sh"
+# Source this before running any terragrunt, ansible, or utility command.
+# Consumer standalone scripts (Category C): source "$(git rev-parse --show-toplevel)/set_env.sh"
+# Framework scripts must NOT use git rev-parse — see infra/_framework-pkg/_docs/set-env-bootstrap-standard.md
 #
 # On every source it:
 #   1. Exports path variables (_FRAMEWORK_PKG_DIR, _MAIN_PKG_DIR, tool paths, dynamic dirs, GCS bucket)
@@ -42,7 +43,7 @@ _set_env_export_vars() {
     # These point to executable scripts that other tools, Makefiles, and Terragrunt hooks invoke.
     export _UTILITIES_DIR="$_FRAMEWORK_DIR/_utilities"                # shared bash/python/ansible lib
     export _ANSIBLE_ROLES_DIR="$_UTILITIES_DIR/ansible/roles"         # roles used by all playbooks
-    export _GENERATE_INVENTORY="$_FRAMEWORK_DIR/_generate-inventory/run"   # kept: has Makefile
+    export _GENERATE_INVENTORY="$_FRAMEWORK_DIR/_generate-inventory/run"   # entry-point is `run` (has Makefile); not added to PATH
     export _WRITE_EXIT_STATUS="$_UTILITIES_DIR/tg-scripts/write-exit-status/write-exit-status"  # tg hook helper
     export _CONFIG_MGR="$_FRAMEWORK_DIR/_config-mgr/config-mgr"       # pre-process, read, and write framework config (generate/get/set/set-raw/move)
     export _PKG_MGR="$_FRAMEWORK_DIR/_pkg-mgr/pkg-mgr"                # external package clone/sync
